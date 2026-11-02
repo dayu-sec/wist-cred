@@ -20,8 +20,23 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+    defaults:
+      run:
+        working-directory: wist-cred
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout wist-cred
+        uses: actions/checkout@v7
+        with:
+          path: wist-cred
+
+      # dev-dependency 是本地 `../wist-auth`：cargo 解依赖时要能看见它，
+      # 否则连 `cargo build` 都会报 `no matching package named wist-auth`。
+      - name: Checkout wist-auth（dev-dependency）
+        uses: actions/checkout@v7
+        with:
+          repository: dayu-sec/wist-auth
+          ref: main
+          path: wist-auth
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,10 +54,11 @@ jobs:
           cp config.example.toml artifacts/config.example.toml
           tar -czf "wist-cred-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-cred config.example.toml
 
+      # 注意：action 的 path 相对 `github.workspace` 解析，不跟 working-directory。
       - uses: actions/upload-artifact@v7
         with:
           name: wist-cred-${{ matrix.target }}
-          path: wist-cred-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: wist-cred/wist-cred-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
