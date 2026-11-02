@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1-alpha] - 2026-11-03
+
+### 变更
+
+- **镜像改从腾讯云 TCR 拉取**：`dy-sec.tencentcloudcr.com/cloud/wist-cred:<tag>`，
+  amd64 / arm64 多架构。国内服务器不再需要绕 ghcr.io；GitHub Release 上的 Linux tarball 不变。
+
 ## [0.1.0-alpha] - 2026-11-03
 
 首个可部署版本：为程序签发**访问凭据**（明文只出现一次、服务端只存摘要），把摘要推给验证方，
