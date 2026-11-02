@@ -2,3 +2,7 @@
 _gal/.report/
 .run*
 .wist/
+
+# release 流水线在 build context 里按架构摆的二进制（见 .github/workflows/release.yml）
+/docker/amd64
+/docker/arm64

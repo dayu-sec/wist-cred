@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. 按平台原生编译二进制，产出 tarball（直接下载 + 供 Docker 镜像用）
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cargo build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          mkdir -p artifacts
+          cp "target/${{ matrix.target }}/release/wist-cred" artifacts/wist-cred
+          # 配置样例随包走：没有它，拿到二进制的人不知道该写哪些段。
+          cp config.example.toml artifacts/config.example.toml
+          tar -czf "wist-cred-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-cred config.example.toml
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wist-cred-${{ matrix.target }}
+          path: wist-cred-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # 2. 用 Linux 二进制构建并推送多架构 Docker 镜像（ghcr.io）
+  docker:
+    needs: [build-binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wist-cred-*-linux-gnu
+          path: staged
+          merge-multiple: true
+
+      - name: Stage binaries for docker build
+        run: |
+          mkdir -p docker/amd64 docker/arm64
+          tar -xzf "staged/wist-cred-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" -C docker/amd64
+          tar -xzf "staged/wist-cred-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz" -C docker/arm64
+          ls -R docker/amd64 docker/arm64
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 国内镜像源（腾讯云 TCR）：要启用就把下面几段打开，并在仓里配好
+      # Variables：TCR_REGISTRY（如 dy-sec.tencentcloudcr.com）、TCR_PROJECT（如 cloud）
+      # Secrets：  TCR_USERNAME / TCR_PASSWORD
+      # 没配之前不出现，避免每次发版都因为缺 secret 变红。
+      #
+      # - uses: docker/login-action@v3
+      #   with:
+      #     registry: ${{ vars.TCR_REGISTRY }}
+      #     username: ${{ secrets.TCR_USERNAME }}
+      #     password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          # 预发布 tag（v0.1.0-alpha / -beta / -rc …）只推该 tag，**不覆盖 :latest**：
+          # 否则 :latest 会指向预发布产物，而 wist-cred-stack 默认按 tag 拉的是稳定版。
+          # 注意 on.push.tags 的 `v*.*.*` 也会匹配 `v0.1.0-alpha`，不能指望触发条件区分。
+          ghcr="ghcr.io/${{ github.repository }}"
+          tags="$(printf '%s:%s' "$ghcr" "${{ github.ref_name }}")"
+          case "${{ github.ref_name }}" in
+            *-*)
+              ;;
+            *)
+              tags="$(printf '%s\n%s' "$tags" "$ghcr:latest")"
+              ;;
+          esac
+          printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64,linux/arm64
+
+  # 3. 发布 tarball 到 GitHub Release
+  release:
+    needs: [build-binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wist-cred-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/*.tar.gz
