@@ -29,22 +29,37 @@ max_ttl_seconds = 2592000              # 30d（脚本）
 break_glass_max_ttl_seconds = 7776000  # 90d
 overlap_seconds = 300
 
-# 推送目标：每个 X 一条。
-# P2 可以整段留空 —— 先人工分发摘要，推送留到有第二个 X 的时候再做。
-[[issue.targets]]
-name = "wist-center"
-endpoint = "https://center:3103/api/v1/internal/credentials"
-audience = "wist-center"
-client_cert = "/etc/wist/cred/push.pem"
-client_key = "/etc/wist/cred/push.key"
-# 两方向不同 CA：client_* 由 CA-I 签；ca 是 CA-S 信任锚（校 X 的服务器证书）
-ca = "${SEC_CA_S_BUNDLE}"
+# ── 推送：一套身份，所有认证系统共用 ────────────────────────────────────
+# 两个方向不是同一把 CA：client_* 由 CA-I 签（证明"我是 cred"），
+# ca 是 CA-S 信任锚（校 X 的服务器证书）。
+# 没有这一段 = 不推送（全靠手工分发），心跳也不会跑。
+#
+# [push]
+# client_cert = "/etc/wist/cred/client.crt"
+# client_key  = "/etc/wist/cred/client.key"
+# ca          = "/etc/wist/cred/ca-s.crt"
+# timeout_seconds = 10
 
-[[issue.targets]]
-name = "wist-ingest"
-endpoint = "https://ingest.internal/api/v1/internal/credentials"
-audience = "wist-ingest"
-client_cert = "/etc/wist/cred/push.pem"
-client_key = "/etc/wist/cred/push.key"
-# 两方向不同 CA：client_* 由 CA-I 签；ca 是 CA-S 信任锚（校 X 的服务器证书）
-ca = "${SEC_CA_S_BUNDLE}"
+# ── 认证系统（验证方 X）───────────────────────────────────
+#
+# 认证系统**不是配置项**：它们落在 `store_path` 指向的注册表（运行期可写，页面可建）。
+# 下面只是它的**部署种子目录**：`scripts/gen-pki.sh` 写出 `<name>/peer.json`，
+# 启动时导入一次；注册表里已有的条目不覆盖。
+#
+# 口径与 center ↔ gwlinkd 入场一致：
+#   · X 在**本机**生成密钥对，私钥永不上送；
+#   · 只交 CSR（只含公钥），本服务按 CSR 签；
+#   · 证书主体（CN / DNS SAN）由本服务按 `peer.json` 的 host 填，CSR 声明一律忽略。
+#
+# `ca_cert` / `ca_key` 是签 X 服务器证书的那把 CA（CA-S），必须与 `[push].ca` 同源。
+# `client_ca` 是 CA-I 的公开证书，交给 X 当信任锚（验 cred 的客户端证书）。
+#
+# [onboarding]
+# dir = "/wist-cred/identity/onboarding"
+# store_path = "/wist-cred/state/peers.json"
+# script_ttl_seconds = 900          # 一次性接入券，上限 3600
+# ca_cert = "/wist-cred/identity/ca-s.crt"
+# ca_key  = "/wist-cred/identity/ca-s.key"
+# client_ca = "/wist-cred/identity/ca-i.crt"
+# peer_cert_ttl_seconds = 7776000   # 签给 X 的服务器证书有效期（90d）
+# heartbeat_seconds = 30            # 心跳间隔；0 = 关闭

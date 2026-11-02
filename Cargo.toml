@@ -18,14 +18,21 @@ serde_json = "1"
 sha2 = "0.10"
 # 凭据明文的高熵随机源。
 getrandom = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+# 推送：双向 TLS 客户端（客户端证书由 CA-I 签，服务端证书用 CA-S 信任锚校）。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 toml = "1.1"
+# 与 center / gwlinkd / ingest-ctrl 同一套 PKI 原语：CA 按 CSR 签、主体由 CA 填、
+# notBefore 回拨 300s、随机序列号。**不自己另写一套。**
+wist-pki = "0.1.2"
 # 配置里的 `${SEC_...}`：与其它服务同口径（env 优先，其次 `.galaxy/sec_value.yml`）。
 orion-sec = "0.7"
 orion-variate = "0.14"
 
 [dev-dependencies]
 http-body-util = "0.1"
+# 测试里要造真的 CSR（与 gwlinkd 同一套：私钥不上送，只交公钥）。
+rcgen = { version = "0.13", features = ["pem"] }
 tower = { version = "0.5", features = ["util"] }
 # 本地 path 联调：闭环测试要拿验证侧的真实实现来验，不是一个 mock。
 wist-auth = { path = "../wist-auth", default-features = false, features = ["credential"] }

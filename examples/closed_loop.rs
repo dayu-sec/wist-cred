@@ -27,7 +27,11 @@ use tower::ServiceExt;
 
 use wist_auth::credential::{CredentialEntry, CredentialError, CredentialStore, StoreParams};
 use wist_cred::api::{self, AppState};
-use wist_cred::config::{AuthMode, Config, IssueConfig, ServerConfig, StorageConfig};
+use wist_cred::config::{
+    AuthMode, Config, IssueConfig, OnboardingConfig, ServerConfig, StorageConfig,
+};
+use wist_cred::onboarding::TicketStore;
+use wist_cred::peers::{NewPeer, PeerRegistry};
 use wist_cred::store::Store;
 
 const OPERATOR_HEADER: &str = "x-wist-operator";
@@ -60,12 +64,42 @@ async fn main() -> anyhow::Result<()> {
             max_ttl_seconds: 2_592_000,
             break_glass_max_ttl_seconds: 7_776_000,
             overlap_seconds: 300,
-            targets: Vec::new(),
+        },
+        push: None,
+        onboarding: OnboardingConfig {
+            dir: None,
+            store_path: dir.join("peers.json"),
+            script_ttl_seconds: 900,
+            ca_cert: None,
+            ca_key: None,
+            client_ca: None,
+            peer_cert_ttl_seconds: 7_776_000,
+            heartbeat_seconds: 0,
         },
     };
+
+    // 一个认证系统（有受众才有意义；没有 endpoint = 人工分发模式）。
+    let peers = Arc::new(PeerRegistry::open(config.onboarding.store_path.clone())?);
+    peers
+        .create(
+            NewPeer {
+                name: "wist-center".to_string(),
+                host: Some("center.internal".to_string()),
+                endpoint: None,
+                healthz: None,
+                roles: vec!["investigation:run".to_string()],
+            },
+            "closed-loop",
+        )
+        .map_err(|err| anyhow::anyhow!("create peer: {err:?}"))?;
+
     let state = AppState {
         config: Arc::new(config.clone()),
         store: Arc::new(Store::open(cred_store_path.clone())?),
+        push: None,
+        boarding: Arc::new(TicketStore::new(config.onboarding.script_ttl_seconds)),
+        signer: None,
+        peers,
     };
 
     // ── ① 签发 ──────────────────────────────────────────────

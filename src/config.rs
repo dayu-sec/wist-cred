@@ -1,12 +1,13 @@
 //! 分层配置：主配置 + `${VAR}` 展开（与 center / console 同口径，fail-closed）。
 //!
-//! 两条硬约束在**加载期**就拒绝启动（设计文档 §3.4 的 S1）：
+//! 几条**加载期就拒绝启动**的约束（设计文档 §3.4 的 S1）：
 //!
 //! - `mode = "ingress"` 时 listener 不得绑 `0.0.0.0` / `[::]`——同一份代码绑到公网就是后门；
-//! - `mode = "ingress"` 时 `trusted_peers` 不能为空，否则等于谁都能注入操作者头。
+//! - `mode = "ingress"` 时 `trusted_peers` 不能为空，否则等于谁都能注入操作者头；
+//! - `mode = "oidc"` 是留给用户中心 / 钉钉的位置，**本期不实现**：显式写出来会直接拒绝启动；
+//! - 签发 CA 与推送信任锚必须是同一把 CA，否则会签出自己认不了的证书。
 //!
-//! `mode = "oidc"` 是留给用户中心 / 钉钉的位置，**本期不实现**：显式写出来会直接拒绝启动，
-//! 而不是静默退化成不校验。
+//! 认证系统（验证方 X）**不在配置里**：它落在 `state/peers.json`，运行期可增删（见 `peers`）。
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,9 @@ pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub issue: IssueConfig,
+    /// `None` = 不推送（P2 人工分发）。
+    pub push: Option<PushConfig>,
+    pub onboarding: OnboardingConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -56,18 +60,37 @@ pub struct IssueConfig {
     pub max_ttl_seconds: u64,
     pub break_glass_max_ttl_seconds: u64,
     pub overlap_seconds: u64,
-    pub targets: Vec<TargetConfig>,
 }
 
-/// 一个验证方（X）。缺省 `client_cert` / `client_key` 时表示推送走同栈内网、不再另带证书。
+/// 推送：每个认证系统共用这一套身份与信任锚，只有 URL 不同。
 #[derive(Debug, Clone)]
-pub struct TargetConfig {
-    pub name: String,
-    pub endpoint: String,
-    pub audience: String,
-    pub client_cert: Option<PathBuf>,
-    pub client_key: Option<PathBuf>,
-    pub ca: Option<PathBuf>,
+pub struct PushConfig {
+    /// CA-I 签的客户端证书（证明"我是 cred"）。
+    pub client_cert: PathBuf,
+    pub client_key: PathBuf,
+    /// CA-S 信任锚（校 X 的服务器证书）。
+    pub ca: PathBuf,
+    pub timeout_seconds: u64,
+}
+
+/// 接入：签发验证方服务器证书 + 一次性券。
+#[derive(Debug, Clone)]
+pub struct OnboardingConfig {
+    /// 部署态种子目录（`scripts/gen-pki.sh` 的产物），首次启动导入一次。
+    pub dir: Option<PathBuf>,
+    /// 注册表落点（`state/peers.json`）。运行期可写。
+    pub store_path: PathBuf,
+    /// 一次性接入券的有效期。
+    pub script_ttl_seconds: u64,
+    /// 签 X 服务器证书的 CA（CA-S）。
+    pub ca_cert: Option<PathBuf>,
+    pub ca_key: Option<PathBuf>,
+    /// 交给 X 的信任锚（CA-I 的**公开证书**），签 CSR 时一起下发。
+    pub client_ca: Option<PathBuf>,
+    /// 签给 X 的服务器证书有效期。
+    pub peer_cert_ttl_seconds: u64,
+    /// 心跳间隔；`0` = 关闭心跳（页面会一直显示"未知"）。
+    pub heartbeat_seconds: u64,
 }
 
 impl Config {
@@ -137,7 +160,22 @@ fn listener_host(addr: &str) -> &str {
 /// `0.0.0.0` / `::` / `*` —— 表示"任何对端都能来"。
 fn is_unspecified_host(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-    matches!(host, "0.0.0.0" | "::" | "*")
+    if host == "*" {
+        return true;
+    }
+    // 按 IP 解析而不是字面比对：`0:0:0:0:0:0:0:0` 也是“任何地址”。
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_unspecified())
+        .unwrap_or(false)
+}
+
+/// 比 PEM 内容时忽略行尾空白与末尾空行：同一张证书经常被不同工具写出不同的尾部。
+fn normalize_pem(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +187,10 @@ struct RawConfig {
     storage: RawStorage,
     #[serde(default)]
     issue: RawIssue,
+    #[serde(default)]
+    push: Option<RawPush>,
+    #[serde(default)]
+    onboarding: RawOnboarding,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,8 +243,6 @@ struct RawIssue {
     break_glass_max_ttl_seconds: u64,
     #[serde(default = "default_overlap")]
     overlap_seconds: u64,
-    #[serde(default)]
-    targets: Vec<RawTarget>,
 }
 
 impl Default for RawIssue {
@@ -212,23 +252,54 @@ impl Default for RawIssue {
             max_ttl_seconds: default_max_ttl(),
             break_glass_max_ttl_seconds: default_break_glass_ttl(),
             overlap_seconds: default_overlap(),
-            targets: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTarget {
-    name: String,
-    endpoint: String,
-    audience: String,
+struct RawPush {
+    client_cert: PathBuf,
+    client_key: PathBuf,
+    ca: PathBuf,
+    #[serde(default = "default_push_timeout")]
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOnboarding {
     #[serde(default)]
-    client_cert: Option<PathBuf>,
+    dir: Option<PathBuf>,
+    #[serde(default = "default_peers_path")]
+    store_path: PathBuf,
+    #[serde(default = "default_script_ttl")]
+    script_ttl_seconds: u64,
     #[serde(default)]
-    client_key: Option<PathBuf>,
+    ca_cert: Option<PathBuf>,
     #[serde(default)]
-    ca: Option<PathBuf>,
+    ca_key: Option<PathBuf>,
+    #[serde(default)]
+    client_ca: Option<PathBuf>,
+    #[serde(default = "default_peer_cert_ttl")]
+    peer_cert_ttl_seconds: u64,
+    #[serde(default = "default_heartbeat")]
+    heartbeat_seconds: u64,
+}
+
+impl Default for RawOnboarding {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            store_path: default_peers_path(),
+            script_ttl_seconds: default_script_ttl(),
+            ca_cert: None,
+            ca_key: None,
+            client_ca: None,
+            peer_cert_ttl_seconds: default_peer_cert_ttl(),
+            heartbeat_seconds: default_heartbeat(),
+        }
+    }
 }
 
 fn default_listen() -> String {
@@ -247,6 +318,10 @@ fn default_storage_path() -> PathBuf {
     PathBuf::from("state/credentials.db")
 }
 
+fn default_peers_path() -> PathBuf {
+    PathBuf::from("state/peers.json")
+}
+
 fn default_digest() -> String {
     SUPPORTED_DIGEST.to_string()
 }
@@ -261,6 +336,22 @@ fn default_break_glass_ttl() -> u64 {
 
 fn default_overlap() -> u64 {
     300
+}
+
+fn default_script_ttl() -> u64 {
+    15 * 60
+}
+
+fn default_peer_cert_ttl() -> u64 {
+    90 * 24 * 60 * 60
+}
+
+fn default_heartbeat() -> u64 {
+    30
+}
+
+fn default_push_timeout() -> u64 {
+    10
 }
 
 impl RawConfig {
@@ -291,6 +382,19 @@ impl RawConfig {
             if self.server.trusted_peers.is_empty() {
                 bail!("server.trusted_peers must list at least one peer when mode = ingress");
             }
+            // 加载期就把写错的规则打回去：否则错一个 CIDR 就是“所有人 401”，
+            // 而且每个请求都会刷一条 warn。
+            for rule in &self.server.trusted_peers {
+                let rule = rule.trim();
+                if rule.is_empty() {
+                    bail!("server.trusted_peers must not contain empty entries");
+                }
+                if !crate::api::trusted_peer_rule_is_valid(rule) {
+                    bail!(
+                        "server.trusted_peers entry {rule:?} is not an IP, a CIDR, or unix:<path>"
+                    );
+                }
+            }
         }
 
         let storage_path = expand(env, &self.storage.path.to_string_lossy())?;
@@ -309,34 +413,66 @@ impl RawConfig {
             bail!("issue.break_glass_max_ttl_seconds must be >= issue.max_ttl_seconds");
         }
 
-        let mut targets = Vec::with_capacity(self.issue.targets.len());
-        for raw in self.issue.targets {
-            let name = expand(env, &raw.name)?;
-            let endpoint = expand(env, &raw.endpoint)?;
-            let audience = expand(env, &raw.audience)?;
-            if name.trim().is_empty() || endpoint.trim().is_empty() || audience.trim().is_empty() {
-                bail!("issue.targets entries need non-empty name / endpoint / audience");
-            }
-            match (&raw.client_cert, &raw.client_key) {
-                (Some(_), None) | (None, Some(_)) => {
-                    bail!("issue.targets[{name}]: client_cert and client_key must be set together")
+        let path_of = |value: &PathBuf| -> anyhow::Result<PathBuf> {
+            Ok(PathBuf::from(expand(env, &value.to_string_lossy())?))
+        };
+
+        let push = match self.push {
+            Some(raw) => {
+                if raw.timeout_seconds == 0 {
+                    bail!("push.timeout_seconds must be > 0");
                 }
-                _ => {}
+                Some(PushConfig {
+                    client_cert: path_of(&raw.client_cert)?,
+                    client_key: path_of(&raw.client_key)?,
+                    ca: path_of(&raw.ca)?,
+                    timeout_seconds: raw.timeout_seconds,
+                })
             }
-            let expand_path = |value: Option<&PathBuf>| -> anyhow::Result<Option<PathBuf>> {
-                match value {
-                    Some(path) => Ok(Some(PathBuf::from(expand(env, &path.to_string_lossy())?))),
-                    None => Ok(None),
-                }
-            };
-            targets.push(TargetConfig {
-                name,
-                endpoint,
-                audience,
-                client_cert: expand_path(raw.client_cert.as_ref())?,
-                client_key: expand_path(raw.client_key.as_ref())?,
-                ca: expand_path(raw.ca.as_ref())?,
-            });
+            None => None,
+        };
+
+        if self.onboarding.script_ttl_seconds == 0 {
+            bail!("onboarding.script_ttl_seconds must be > 0");
+        }
+        // 上限压到 1 小时：一次性凭据不该有长窗口。
+        if self.onboarding.script_ttl_seconds > 3600 {
+            bail!("onboarding.script_ttl_seconds must be <= 3600");
+        }
+        if self.onboarding.peer_cert_ttl_seconds == 0 {
+            bail!("onboarding.peer_cert_ttl_seconds must be > 0");
+        }
+        let onboard_ca = match (&self.onboarding.ca_cert, &self.onboarding.ca_key) {
+            (Some(cert), Some(key)) => Some((path_of(cert)?, path_of(key)?)),
+            (None, None) => None,
+            _ => bail!("onboarding.ca_cert and onboarding.ca_key must be set together"),
+        };
+
+        let store_path = expand(env, &self.onboarding.store_path.to_string_lossy())?;
+        if store_path.trim().is_empty() {
+            bail!("onboarding.store_path must not be empty");
+        }
+        let onboarding_dir = match &self.onboarding.dir {
+            Some(path) => Some(path_of(path)?),
+            None => None,
+        };
+        let client_ca = match &self.onboarding.client_ca {
+            Some(path) => Some(path_of(path)?),
+            None => None,
+        };
+
+        // 签证书用的 CA 必须就是推数时验证对方的那把 —— 否则会签出自己认不了的证书。
+        if let (Some((cert_path, _)), Some(push)) = (&onboard_ca, &push) {
+            let signing = std::fs::read_to_string(cert_path)
+                .with_context(|| format!("read onboarding.ca_cert {}", cert_path.display()))?;
+            let anchoring = std::fs::read_to_string(&push.ca)
+                .with_context(|| format!("read push.ca {}", push.ca.display()))?;
+            if normalize_pem(&signing) != normalize_pem(&anchoring) {
+                bail!(
+                    "onboarding.ca_cert and push.ca are different CAs; \
+                     certificates signed by one cannot be verified with the other"
+                );
+            }
         }
 
         Ok(Config {
@@ -354,7 +490,17 @@ impl RawConfig {
                 max_ttl_seconds: self.issue.max_ttl_seconds,
                 break_glass_max_ttl_seconds: self.issue.break_glass_max_ttl_seconds,
                 overlap_seconds: self.issue.overlap_seconds,
-                targets,
+            },
+            push,
+            onboarding: OnboardingConfig {
+                dir: onboarding_dir,
+                store_path: PathBuf::from(store_path),
+                script_ttl_seconds: self.onboarding.script_ttl_seconds,
+                ca_cert: onboard_ca.as_ref().map(|(cert, _)| cert.clone()),
+                ca_key: onboard_ca.map(|(_, key)| key),
+                client_ca,
+                peer_cert_ttl_seconds: self.onboarding.peer_cert_ttl_seconds,
+                heartbeat_seconds: self.onboarding.heartbeat_seconds,
             },
         })
     }
@@ -383,12 +529,49 @@ mod tests {
         assert_eq!(config.server.ingress_header, "x-wist-operator");
         assert_eq!(config.issue.digest, "sha256");
         assert_eq!(config.issue.max_ttl_seconds, 30 * 24 * 60 * 60);
-        assert!(config.issue.targets.is_empty());
+        assert!(config.push.is_none());
+        assert_eq!(config.onboarding.heartbeat_seconds, 30);
+        assert_eq!(config.onboarding.script_ttl_seconds, 900);
+    }
+
+    #[test]
+    fn accepts_a_loopback_listener_because_it_is_not_unspecified() {
+        let text = "[server]\nlisten_addr = \"[::1]:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"127.0.0.1/32\"]\n";
+        assert!(parse(text).is_ok(), "loopback must be allowed");
+    }
+
+    #[test]
+    fn rejects_trusted_peers_entries_that_would_never_match() {
+        // 写错一个 CIDR 的结果是“所有人 401”，且每个请求刷一条 warn —— 加载期就拦。
+        for rule in ["10.0.0.0/33", "not-an-ip", "", "10.0.0.0/"] {
+            let text = format!(
+                "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"{rule}\"]\n"
+            );
+            let err = parse(&text).expect_err("must reject {rule:?}");
+            assert!(
+                err.to_string().contains("trusted_peers"),
+                "unexpected error for {rule:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_unix_entries_beside_ip_entries() {
+        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"10.0.20.10/32\", \"unix:/run/wist/cred.sock\"]\n";
+        let config = parse(text).expect("unix entries are allowed in the list");
+        assert_eq!(config.server.trusted_peers.len(), 2);
     }
 
     #[test]
     fn rejects_unspecified_listener_in_ingress_mode() {
-        for addr in ["0.0.0.0:8443", "[::]:8443", "*:8443"] {
+        for addr in [
+            "0.0.0.0:8443",
+            "[::]:8443",
+            "*:8443",
+            // IPv6 的长写：字面比对会漏掉它，按 IP 解析才拦得住。
+            "[0:0:0:0:0:0:0:0]:8443",
+            "[::0]:8443",
+        ] {
             let text = format!(
                 "[server]\nlisten_addr = \"{addr}\"\nmode = \"ingress\"\ntrusted_peers = [\"10.0.0.1/32\"]\n"
             );
@@ -418,23 +601,75 @@ mod tests {
     }
 
     #[test]
-    fn rejects_target_with_half_a_client_identity() {
-        let text = r#"
-            [server]
-            listen_addr = "10.0.20.11:8443"
-            mode = "ingress"
-            trusted_peers = ["10.0.20.10/32"]
+    fn rejects_onboarding_ttl_above_one_hour() {
+        let text = format!("{MINIMAL}\n[onboarding]\nscript_ttl_seconds = 7200\n");
+        let err = parse(&text).expect_err("long-lived ticket must be rejected");
+        assert!(err.to_string().contains("3600"), "unexpected error: {err}");
+    }
 
-            [[issue.targets]]
-            name = "wist-center"
-            endpoint = "https://center:3103/api/v1/internal/credentials"
-            audience = "wist-center"
-            client_cert = "/etc/wist/cred/push.pem"
-        "#;
-        let err = parse(text).expect_err("half identity must be rejected");
+    #[test]
+    fn rejects_half_a_signing_ca() {
+        let text = format!("{MINIMAL}\n[onboarding]\nca_cert = \"/x/ca.crt\"\n");
+        let err = parse(&text).expect_err("half CA must be rejected");
         assert!(
-            err.to_string().contains("client_key"),
+            err.to_string().contains("ca_key"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_a_signing_ca_that_differs_from_the_push_anchor() {
+        let dir = tempdir::TempDirGuard::new();
+        let signing = dir.path.join("signing.crt");
+        let anchoring = dir.path.join("anchor.crt");
+        std::fs::write(
+            &signing,
+            "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &anchoring,
+            "-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let key = dir.path.join("ca.key");
+        std::fs::write(&key, "KEY").unwrap();
+
+        let text = format!(
+            "{MINIMAL}\n[push]\nclient_cert = \"/x/c.crt\"\nclient_key = \"/x/c.key\"\nca = {:?}\n\n[onboarding]\nca_cert = {:?}\nca_key = {:?}\n",
+            anchoring.display().to_string(),
+            signing.display().to_string(),
+            key.display().to_string()
+        );
+        let err = parse(&text).expect_err("different CAs must be rejected");
+        assert!(
+            err.to_string().contains("different CAs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    mod tempdir {
+        use std::path::PathBuf;
+
+        pub struct TempDirGuard {
+            pub path: PathBuf,
+        }
+
+        impl TempDirGuard {
+            pub fn new() -> Self {
+                let mut bytes = [0u8; 8];
+                getrandom::fill(&mut bytes).expect("entropy");
+                let name: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                let path = std::env::temp_dir().join(format!("wist-cred-config-{name}"));
+                std::fs::create_dir_all(&path).expect("create temp dir");
+                Self { path }
+            }
+        }
+
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
     }
 }

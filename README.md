@@ -14,7 +14,7 @@ Wist **凭据服务**（设计文档里的 **C**）。
 |---|---|
 | **wist-cred**（本仓） | 签发 / 撤销 / 推送，只存 `sha256` 摘要 |
 | `wist-cred-web` | 管理页面：为程序创建 / 撤销凭据，明文仅一次性展示 |
-| `wist-cred-stack` | gops 部署栈：编排、配置渲染、CA-I 证书与密钥注入 |
+| `wist-cred-stack` | gops 部署栈：编排、配置渲染、PKI 与验证方接入包 |
 
 ## 端点
 
@@ -25,6 +25,13 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `GET /api/v1/credentials` | 列出已发放凭据（**永不含摘要与明文**） |
 | `GET /api/v1/credentials/{id}` | 单条 |
 | `POST /api/v1/credentials/{id}/revoke` | 撤销（幂等：重放不重复升 revision） |
+| `GET /api/v1/policy` | 签发策略：`max_ttl_seconds` / `break_glass_max_ttl_seconds`（页面用它把超限选项标出来） |
+| `GET /api/v1/onboarding/peers` | 列出认证系统（含**心跳状态**：`unknown` / `up`+延迟 / `down`+原因） |
+| `POST /api/v1/onboarding/peers` | 新建认证系统（名称 / 主机名 / 收数地址）；落 `state/peers.json`，**不需重启** |
+| `POST /api/v1/onboarding/peers/{name}/endpoint` | 改收数地址（`null` = 退回手工分发），下一轮心跳即生效 |
+| `POST /api/v1/onboarding/peers/{name}/script` | 签一张**一次性**接入券（默认 900s） |
+| `GET /onboarding/script/{token}` | 取出接入脚本（**只有公开材料 + 券，无任何私钥**） |
+| `POST /onboarding/enroll/{token}` | X 交 CSR 换自己的服务器证书（**兑现券**，一次性） |
 | `GET /healthz` / `GET /version` | 探针 |
 
 ### 创建
@@ -58,6 +65,16 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
 | `mode = "oidc"` | 加载期拒绝启动（本期不做） |
 | `ttl_seconds` 超上限 | 静默压到上限（脚本 30d / break-glass 90d） |
 | 配了 `[[issue.targets]]` 但 `audience` 不在其中 | `400 audience_not_configured` |
+| `onboarding.script_ttl_seconds` > 3600 | 加载期拒绝启动 |
+| `onboarding.ca_cert` 与 `[[issue.targets]].ca` 不是同一把 | 加载期拒启（会签出自己认不了的证书） |
+| 有 peer 但没配 `onboarding.ca_cert` / `ca_key` | `503 enrollment_disabled`（建系统/接入被拒） |
+| `[push].ca` 与 `onboarding.ca_cert` 不是同一把 | 加载期拒绝启动 |
+| 认证系统名冲突 / 受众重复 | `409 peer_conflict` |
+| 请求里的角色不在该认证系统上报的列表里 | `400 role_not_supported`（错误信息会列出它支持什么） |
+| `endpoint` 不是 `https://` | `400 invalid_peer`（推送走 mTLS，不收明文） |
+| 认证系统有 `endpoint` 但推送失败 | `500 credential_delivery_pending`，**不给明文** |
+| 接入券重复兑现 / 过期 | `401 enrollment_rejected`（不区分原因） |
+| 坏 CSR | `400 invalid_csr`，**不消耗券** |
 
 ## 运行
 
