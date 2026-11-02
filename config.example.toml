@@ -1,0 +1,48 @@
+# wist-cred 配置示例 —— 复制成 `cred.toml`（或用 `WIST_CRED_CONFIG` 指过去），按现场改。
+#
+# 密钥走 `${SEC_...}`：由 `WIST_CRED_SEC_FILE` 指向的 yml 解析（与 center / console 同口径）。
+#
+# 两条**加载期就会拒绝启动**的约束（设计文档 §3.4 的 S1 / S2）：
+#   1. `mode = "ingress"` 时 `listen_addr` 不能是 `0.0.0.0` / `[::]` —— 同一份代码绑到公网就是后门；
+#   2. `mode = "ingress"` 时 `trusted_peers` 不能为空 —— 否则等于谁都能注入操作者头。
+
+[server]
+# 人机面：内网反代 / 跳板之后。绑**私网地址**，不要 0.0.0.0。
+listen_addr = "10.0.20.11:8443"
+# 页面由 `wist-cred-web` 提供，它调本服务的 `/api/v1/credentials`。
+mode = "ingress"
+ingress_header = "x-wist-operator"
+# 只认这些对端：内网反代 / 跳板 / 同机 socket。
+trusted_peers = ["10.0.20.10/32", "127.0.0.1/32", "unix:/run/wist/cred.sock"]
+
+# 阶段二（**现在不做**）：接用户中心 / 钉钉 OIDC。页面与授权逻辑不变，只换认证来源。
+# 注意：写出来会**直接拒绝启动**，而不是静默退化成不校验。
+# mode = "oidc"
+
+[storage]
+# 自己的小表。**不复用 center 的 PG** —— 那个库在接入区，跨区依赖会把两边一起拖下水。
+path = "state/credentials.db"
+
+[issue]
+digest = "sha256"
+max_ttl_seconds = 2592000              # 30d（脚本）
+break_glass_max_ttl_seconds = 7776000  # 90d
+overlap_seconds = 300
+
+# 推送目标：每个 X 一条。
+# P2 可以整段留空 —— 先人工分发摘要，推送留到有第二个 X 的时候再做。
+[[issue.targets]]
+name = "wist-center"
+endpoint = "https://center:3103/api/v1/internal/credentials"
+audience = "wist-center"
+client_cert = "/etc/wist/cred/push.pem"
+client_key = "/etc/wist/cred/push.key"
+ca = "${SEC_CA_I_BUNDLE}"
+
+[[issue.targets]]
+name = "wist-ingest"
+endpoint = "https://ingest.internal/api/v1/internal/credentials"
+audience = "wist-ingest"
+client_cert = "/etc/wist/cred/push.pem"
+client_key = "/etc/wist/cred/push.key"
+ca = "${SEC_CA_I_BUNDLE}"

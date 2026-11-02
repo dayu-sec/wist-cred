@@ -1,0 +1,25 @@
+[package]
+name = "wist-cred"
+version = "0.1.0" #@gxl:set(version)
+edition = "2024"
+license = "Apache-2.0"
+authors = ["wist Dev Team"]
+description = "凭据服务（C）：为程序签发 / 撤销脚本与 break-glass 凭据，只存 sha256 摘要，向验证方推送 register / revoke"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+toml = "1.1"
+# 配置里的 `${SEC_...}`：与其它服务同口径（env 优先，其次 `.galaxy/sec_value.yml`）。
+orion-sec = "0.7"
+orion-variate = "0.14"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
