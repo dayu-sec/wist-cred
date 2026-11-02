@@ -4,6 +4,8 @@
 
 ### Added
 
+- `GET /` 自述路由：浏览器打开根路径不再是一片空白，返回服务名 / 版本 / 端点列表。
+  本服务只有 API，管理页面由 `wist-cred-web` 提供。
 - **P2 签发闭环（cred 侧）**：`POST /api/v1/credentials` 为程序创建凭据，
   明文只在响应里出现一次，磁盘只留 `sha256` 摘要。
 - `GET /api/v1/credentials`、`GET /api/v1/credentials/{id}`、幂等 `revoke`。

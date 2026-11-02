@@ -39,6 +39,7 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(landing))
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route(
@@ -71,6 +72,24 @@ struct CreateRequest {
 
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+/// 根路径自述：本服务只有 API，没有页面（避免“浏览器打开一片空白”被当成挂了）。
+async fn landing() -> impl IntoResponse {
+    Json(json!({
+        "service": "wist-cred",
+        "version": env!("CARGO_PKG_VERSION"),
+        "note": "API only; the management page is served by wist-cred-web",
+        "endpoints": [
+            "GET  /healthz",
+            "GET  /version",
+            "GET  /api/v1/credentials",
+            "POST /api/v1/credentials",
+            "GET  /api/v1/credentials/{id}",
+            "POST /api/v1/credentials/{id}/revoke",
+        ],
+        "auth": "requests under /api/v1 need the operator header injected by the ingress",
+    }))
 }
 
 async fn version(State(state): State<AppState>) -> impl IntoResponse {
@@ -575,6 +594,26 @@ mod tests {
             "resources": { "agents": ["agent-7f3"] },
             "audience": "wist-center"
         })
+    }
+
+    #[tokio::test]
+    async fn landing_and_healthz_are_reachable_without_auth() {
+        let harness = Harness::new();
+
+        let (status, body) = harness.call("GET", "/", None, "127.0.0.1", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["service"], "wist-cred");
+        assert!(
+            body["endpoints"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+
+        let (status, body) = harness
+            .call("GET", "/healthz", None, "127.0.0.1", None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
     }
 
     #[tokio::test]
