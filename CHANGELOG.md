@@ -4,8 +4,8 @@
 
 ### 变更
 
-- **镜像改从腾讯云 TCR 拉取**：`dy-sec.tencentcloudcr.com/cloud/wist-cred:<tag>`，
-  amd64 / arm64 多架构。国内服务器不再需要绕 ghcr.io；GitHub Release 上的 Linux tarball 不变。
+- **镜像发布到腾讯云 TCR**：`dy-sec.tencentcloudcr.com/cloud/wist-cred:<tag>`，
+  amd64 / arm64 多架构，部署侧从那里拉取。GitHub Release 上的 Linux tarball 不变。
 
 ## [0.1.0-alpha] - 2026-11-03
 
