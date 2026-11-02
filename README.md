@@ -16,22 +16,47 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `wist-cred-web` | 管理页面：为程序创建 / 撤销凭据，明文仅一次性展示 |
 | `wist-cred-stack` | gops 部署栈：编排、配置渲染、CA-I 证书与密钥注入 |
 
-## 当前状态（骨架）
+## 端点
 
-| 端点 | 状态 |
+| 端点 | 语义 |
 |---|---|
-| `GET /healthz` | ✅ |
-| `GET /version` | ✅ |
-| `POST /api/v1/credentials` | ⏳ `501 not_implemented` |
-| `GET /api/v1/credentials` | ⏳ `501 not_implemented` |
-| `POST /api/v1/credentials/{id}/revoke` | ⏳ `501 not_implemented` |
+| `POST /api/v1/credentials` | 为程序创建凭据；**明文只在响应里出现一次** |
+| `GET /api/v1/credentials` | 列出已发放凭据（**永不含摘要与明文**） |
+| `GET /api/v1/credentials/{id}` | 单条 |
+| `POST /api/v1/credentials/{id}/revoke` | 撤销（幂等：重放不重复升 revision） |
+| `GET /healthz` / `GET /version` | 探针 |
 
-配置校验已生效，两条约束会在**加载期拒绝启动**：
+### 创建
 
-1. `mode = "ingress"` 时 `listen_addr` 不得绑 `0.0.0.0` / `[::]`（S1）；
-2. `mode = "ingress"` 时 `trusted_peers` 不得为空（S2 的前提）。
+```sh
+curl -s -X POST https://cred.internal/api/v1/credentials \
+  -H 'x-wist-operator: alice' \
+  -H 'content-type: application/json' \
+  -d '{
+    "subject": "ci-nightly",
+    "purpose": "nightly disk inspection",
+    "roles": ["investigation:run"],
+    "resources": { "agents": ["agent-7f3"] },
+    "audience": "wist-center"
+  }'
+```
 
-`mode = "oidc"` 是留给用户中心 / 钉钉的位置，**本期写出来会直接拒绝启动**，不会静默退化成不校验。
+- `x-wist-operator` 由**内网入口**注入，客户端不自己填（外部同名头会被入口剥离）。
+- 响应里的 `token`（`wcr_...`）**只此一次**；磁盘只留 `sha256` 摘要 ——
+  实测在 `state/credentials.db` 里搜不到 `wcr_`。
+- `owner` 取自注入头，**不接受请求体覆盖**；`purpose` 必填（进审计）。
+
+### 约束
+
+| 约束 | 行为 |
+|---|---|
+| `mode = "ingress"` 不得绑 `0.0.0.0` / `[::]`（S1） | 加载期拒绝启动 |
+| `mode = "ingress"` 时 `trusted_peers` 为空（S3 的前提） | 加载期拒绝启动 |
+| 对端不在 `trusted_peers` | `401 untrusted_ingress_peer` + 告警 |
+| 缺操作者头 | `401 missing_operator` |
+| `mode = "oidc"` | 加载期拒绝启动（本期不做） |
+| `ttl_seconds` 超上限 | 静默压到上限（脚本 30d / break-glass 90d） |
+| 配了 `[[issue.targets]]` 但 `audience` 不在其中 | `400 audience_not_configured` |
 
 ## 运行
 
