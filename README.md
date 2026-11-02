@@ -70,6 +70,24 @@ gx run build -e debug                 # 版本同步 + 构建 + 测试 + 产物�
 
 也可以直接给配置路径：`wist-cred /path/to/cred.toml`。
 
+## 闭环测试
+
+```sh
+cargo run --example closed_loop
+```
+
+单进程跑完 **签发 → 登记到 `wist_auth::CredentialStore` → 验证 → 撤销 → 再验证**，
+不需要端口、不需要数据库。用本地 `path` 依赖 sibling 的 `../wist-auth`（多 crate 联调口径）。
+
+```text
+① cred 签发   credential_id=cred_...
+② X 登记完成   条目 1 条
+③ 验证通过     subject=ci-nightly roles=["investigation:run"] ...
+   跨服务重放被拒  code=audience_mismatch
+④ cred 撤销   revision=2
+⑤ 再验证失败    code=token_revoked status=401
+```
+
 ## 开发
 
 构建 / 检查 / 测试统一走 `gx`（不要直接 `cargo build`）：

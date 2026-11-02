@@ -27,3 +27,5 @@ orion-variate = "0.14"
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+# 本地 path 联调：闭环测试要拿验证侧的真实实现来验，不是一个 mock。
+wist-auth = { path = "../wist-auth", default-features = false, features = ["credential"] }

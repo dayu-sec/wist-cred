@@ -1778,6 +1778,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wist-auth"
+version = "0.1.1"
+dependencies = [
+ "http",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "wist-cred"
 version = "0.1.0"
 dependencies = [
@@ -1795,6 +1805,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "wist-auth",
 ]
 
 [[package]]

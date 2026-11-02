@@ -10,6 +10,8 @@
 - 人机面授权：操作者头（`x-wist-operator`）+ `trusted_peers` CIDR 校验（S3）。
 - `owner`（申请人，取自注入头，不接受请求体覆盖）与 `purpose`（必填，进审计）；
   `last_used_at` 预留列，等 X 侧回传。
+- `examples/closed_loop.rs`：**签发 → 登记 → 验证 → 撤销 → 再验证** 的闭环示例，
+  dev-dependency 走本地 `../wist-auth`（多 crate 联调）。
 
 ### Security
 
