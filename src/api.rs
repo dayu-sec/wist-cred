@@ -408,7 +408,7 @@ async fn fetch_script(
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
 ) -> Response {
-    if !peer_allowed(&state.config, peer.ip()) {
+    if peer_denied(&state.config, peer.ip()) {
         log::warn!("untrusted peer tried to fetch an onboarding script: {peer}");
         return err(
             StatusCode::UNAUTHORIZED,
@@ -526,7 +526,7 @@ async fn enroll_peer(
     AxumPath(token): AxumPath<String>,
     Json(body): Json<EnrollRequest>,
 ) -> Response {
-    if !peer_allowed(&state.config, peer.ip()) {
+    if peer_denied(&state.config, peer.ip()) {
         log::warn!("untrusted peer tried to enroll: {peer}");
         return err(
             StatusCode::UNAUTHORIZED,
@@ -1218,7 +1218,7 @@ impl Denied {
 ///
 /// `trusted_peers` 非空时先过这一道（S3）。
 fn authorize(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> Result<String, Denied> {
-    if !config.server.trusted_peers.is_empty() && !peer_allowed(config, peer.ip()) {
+    if peer_denied(config, peer.ip()) {
         log::warn!("untrusted ingress peer rejected: {peer}");
         return Err(Denied::new(
             StatusCode::UNAUTHORIZED,
@@ -1227,7 +1227,7 @@ fn authorize(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> Result<S
         ));
     }
     match config.server.mode {
-        AuthMode::Token => authorize_password(config, headers),
+        AuthMode::Token => authorize_password(config, peer, headers),
         AuthMode::Ingress => authorize_ingress(config, headers),
         AuthMode::Oidc => Err(Denied::new(
             StatusCode::UNAUTHORIZED,
@@ -1242,7 +1242,15 @@ fn authorize(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> Result<S
 /// 错误码与 gateway 的管理面逐字一致（`missing_admin_bearer_token` /
 /// `invalid_admin_bearer_token`），这样页面一套 401 处理能用两处：
 /// 收到 `invalid_*` 就把本地口令清掉，而不是拿错的密码每 10s 轮询一次。
-fn authorize_password(config: &Config, headers: &HeaderMap) -> Result<String, Denied> {
+///
+/// 为什么这里**没有**像 gateway 那样做失败限流：那把口令是部署方设置的 24 hex（≥ 96 bit），
+/// 在线猜测不可行；而 401 风暴的来源（页面拿错口令轮询）已经在协议上麦掉
+/// （页面收到 `invalid_*` 就地清掉）。将来若接人工设置的弱口令，再补 `FailureLimiter`。
+fn authorize_password(
+    config: &Config,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<String, Denied> {
     let Some(password) = wist_auth::bearer_token(headers) else {
         return Err(Denied::new(
             StatusCode::UNAUTHORIZED,
@@ -1251,7 +1259,8 @@ fn authorize_password(config: &Config, headers: &HeaderMap) -> Result<String, De
         ));
     };
     if !wist_auth::token_matches(password, &config.server.admin_password_hash) {
-        log::warn!("invalid admin password presented");
+        // 只记对端，不记口令（也不能记）：口令多落一处就是多一个泄露面。
+        log::warn!("invalid admin password presented: peer={peer}");
         return Err(Denied::new(
             StatusCode::UNAUTHORIZED,
             "invalid_admin_bearer_token",
@@ -1300,6 +1309,16 @@ fn admin_actor(password_hash: &str) -> String {
 }
 
 /// `trusted_peers`：CIDR / 单个 IP。`unix:` 条目对 TCP 对端不适用，跳过。
+///
+/// **空列表 = 不做来源限制**（只写一处，两种模式、人机面与接入面共用同一个口径）：
+/// 以前这里是“空 = 谁都不行”，而 `ingress` 模式又强制非空，所以看不出差别；
+/// `token` 模式下 `trusted_peers` 是可选的，若接入面仍按“空 = 全拒”处理，
+/// 就会变成“人机面能用、取接入脚本全 401”的隐形故障。
+fn peer_denied(config: &Config, ip: IpAddr) -> bool {
+    !config.server.trusted_peers.is_empty() && !peer_allowed(config, ip)
+}
+
+/// 逐条判断（不处理“空列表”的语义，那在 `peer_denied` 里）。
 fn peer_allowed(config: &Config, ip: IpAddr) -> bool {
     config.server.trusted_peers.iter().any(|rule| {
         let rule = rule.trim();
@@ -1804,6 +1823,51 @@ mod tests {
         let fingerprint: String = wist_auth::sha256_hex(PASSWORD).chars().take(12).collect();
         assert_eq!(owner, format!("admin:{fingerprint}"));
         assert!(!owner.contains(PASSWORD));
+    }
+
+    #[tokio::test]
+    async fn token_mode_keeps_the_peer_allowlist() {
+        // `trusted_peers` 在 token 模式也是真的一道锁（不是只给 ingress 用的）。
+        let mut harness = Harness::new_token("0123456789abcdef01234567");
+        let mut config = (*harness.state.config).clone();
+        config.server.trusted_peers = vec!["127.0.0.1/32".to_string()];
+        harness.state.config = Arc::new(config);
+
+        let (status, body) = harness
+            .call(
+                "GET",
+                "/api/v1/credentials",
+                Some("0123456789abcdef01234567"),
+                "10.9.9.9",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "untrusted_ingress_peer");
+    }
+
+    #[tokio::test]
+    async fn token_mode_leaves_the_onboarding_face_open_to_the_ticket() {
+        // 取接入脚本的是 X（机器），它没有口令 —— 这条路只能靠 URL 里那张一次性券。
+        let harness = Harness::new_token("0123456789abcdef01234567")
+            .with_peer("wist-ingest", "ingest.internal")
+            .with_signer();
+        let (status, minted) = harness
+            .call(
+                "POST",
+                "/api/v1/onboarding/peers/wist-ingest/script",
+                Some("0123456789abcdef01234567"),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        let path = minted["path"].as_str().expect("path").to_string();
+
+        // 不带任何口令：靠券本身。
+        let (status, body) = harness.call_text("GET", &path, None, "127.0.0.1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("curl") || body.contains("#!/"), "{body}");
     }
 
     #[tokio::test]

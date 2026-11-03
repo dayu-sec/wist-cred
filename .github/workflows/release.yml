@@ -29,9 +29,9 @@ jobs:
         with:
           path: wist-cred
 
-      # dev-dependency 是本地 `../wist-auth`：cargo 解依赖时要能看见它，
-      # 否则连 `cargo build` 都会报 `no matching package named wist-auth`。
-      - name: Checkout wist-auth（dev-dependency）
+      # `wist-auth` 是本地 path 依赖（runtime 验页面口令 + dev 闭环验证）：cargo 解依赖时
+      # 要能看见它，否则连 `cargo build` 都会报 `no matching package named wist-auth`。
+      - name: Checkout wist-auth（path 依赖）
         uses: actions/checkout@v7
         with:
           repository: dayu-sec/wist-auth

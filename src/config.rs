@@ -402,6 +402,10 @@ impl RawConfig {
 
         // 页面口令：配置里只有 sha256（跟 gateway / center 的管理面同一个形状）。
         // 明文从 `${SEC_CRED_WEB_PASSWORD}` 来（密钥文件），算完就丢。
+        if mode != AuthMode::Token && self.server.admin_password.is_some() {
+            // 写了但不生效 —— 与“写错了键”一样危险：现场会以为它已经生效。
+            bail!("server.admin_password only applies to mode = token (current mode: {mode:?})");
+        }
         let admin_password_hash = if mode == AuthMode::Token {
             let raw = self.server.admin_password.as_deref().unwrap_or("").trim();
             if raw.is_empty() {
@@ -414,7 +418,15 @@ impl RawConfig {
             if password.trim().is_empty() {
                 bail!("server.admin_password resolved to an empty value");
             }
-            wist_auth::sha256_hex(password.trim())
+            // 两端空白会被裁掉（`wist_auth::bearer_token` 与页面输入都 trim）。
+            // 接受它等于接受一个“看着多一个空格、实际不生效”的口令 —— 直接拒掉。
+            if password != password.trim() {
+                bail!(
+                    "server.admin_password has leading/trailing whitespace; \
+                     it is trimmed on both ends, so a password with spaces can never match"
+                );
+            }
+            wist_auth::sha256_hex(&password)
         } else {
             String::new()
         };
@@ -658,6 +670,44 @@ mod tests {
             "[server]\nlisten_addr = \"0.0.0.0:8443\"\nmode = \"token\"\nadmin_password = \"x\"\n";
         let err = parse(text).expect_err("S1 must reject");
         assert!(err.to_string().contains("S1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn token_mode_rejects_a_password_with_padding() {
+        // 两端空白在 `bearer_token` 与页面输入里都会被裁掉：接受它 = 接受一个
+        // “看着多一个空格、实际永远对不上”的口令。这里走密钥文件那条路（真实现场就是这么写的）——
+        // 写在配置里的字面值本身就会被 trim，真正带空白的是密钥值。
+        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"${PW}\"\n";
+        let err =
+            parse_with_env(text, &[("PW", " abc ")]).expect_err("padded secret must be rejected");
+        assert!(
+            err.to_string().contains("whitespace"),
+            "unexpected error: {err}"
+        );
+
+        // 不带空白的密钥值照常可用（对照组，避免上面是因为别的原因才失败）。
+        assert!(parse_with_env(text, &[("PW", "abc")]).is_ok());
+    }
+
+    #[test]
+    fn admin_password_is_rejected_outside_token_mode() {
+        // 写了但不生效，比写错键更危险：现场会以为它已经生效。
+        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"10.0.20.10/32\"]\nadmin_password = \"x\"\n";
+        let err = parse(text).expect_err("admin_password only applies to token mode");
+        assert!(
+            err.to_string().contains("only applies to mode = token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn token_mode_still_validates_trusted_peers() {
+        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\ntrusted_peers = [\"not-an-ip\"]\n";
+        let err = parse(text).expect_err("bogus CIDR must be rejected in token mode too");
+        assert!(
+            err.to_string().contains("trusted_peers"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

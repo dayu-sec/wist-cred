@@ -30,7 +30,11 @@ orion-sec = "0.7"
 orion-variate = "0.14"
 # 管理凭据的比对原语（与控制台 / center / gwlinkd 同一套）：
 # `bearer_token` + `token_matches`（sha256 常量时间比较）。**不自己另写一份。**
-wist-auth = { version = "0.2", default-features = false }
+#
+# 多 crate 联调口径与 dev-dependency 一致：用**本地 path**（仓组同级摆放），
+# 不在 runtime 引入一份 registry 副本 —— 否则两处版本一漂，“验的人”和“签的人”就会说两套话。
+# 镜像由 release 用**预编译二进制**打（docker/Dockerfile），不依赖这份 path。
+wist-auth = { path = "../wist-auth", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"
@@ -38,4 +42,5 @@ http-body-util = "0.1"
 rcgen = { version = "0.13", features = ["pem"] }
 tower = { version = "0.5", features = ["util"] }
 # 验证侧的真实实作（闭环测试要拿它验，不是一个 mock）。
-wist-auth = { version = "0.2", default-features = false, features = ["credential"] }
+# 同一个 path：features 相加不冲突（runtime 不带 credential，测试才带）。
+wist-auth = { path = "../wist-auth", default-features = false, features = ["credential"] }

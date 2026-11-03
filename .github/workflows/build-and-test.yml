@@ -29,8 +29,8 @@ jobs:
         with:
           path: wist-cred
 
-      # 闭环用例（`examples/closed_loop.rs` 与 api 的单测）用的是**验证侧的真实实现**，
-      # dev-dependency 走本地 `../wist-auth`。所以按仓组摆成同级目录。
+      # `wist-auth` 是**本地 path 依赖**（runtime 用它验页面口令，dev-dependency 用它做闭环验证），
+      # 所以按仓组摆成同级目录；不摆就是 `no matching package named wist-auth`。
       # `ref: main` 是**浮动**的：验证侧改了语义会在这里先红（这正是想要的信号）；
       # 要可复现就改成发布出来的 tag（如 `ref: v0.2.0`）。
       - name: Checkout wist-auth（验证侧实现）

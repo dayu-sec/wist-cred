@@ -2714,8 +2714,6 @@ dependencies = [
 [[package]]
 name = "wist-auth"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7ea4d46a772e4f68fabc7478ad49e0eb1b95219ba829486632c75305bb7042a"
 dependencies = [
  "http",
  "serde",

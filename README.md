@@ -53,7 +53,10 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
   - `token`（发布态）：上面的 `Authorization: Bearer <页面口令>` —— 页面里输的那把，
     配置里只写 `admin_password = "${SEC_CRED_WEB_PASSWORD}"`，加载时算成 sha256、明文丢弃；
   - `ingress`（开发态）：人身份由内网反代注入 `x-wist-operator`，客户端不自己填。
-- 两种模式下都可以再叠 `trusted_peers`（来源 IP 白名单）当第二道锁。
+- **口令两端不能有空白**：两端都会被裁掉（`bearer_token` 与页面输入都 trim），
+  配置里带空白的口令直接拒启 —— 否则会出现“看着对、永远对不上”的怪事。
+- **`trusted_peers` 空 = 不限**：两种模式、人机面与接入面（取脚本 / 登记）用同一个口径；
+  非空时严格匹配（unix 条目对 TCP 对端不生效）。
 - 响应里的 `token`（`wcr_...`）**只此一次**；磁盘只留 `sha256` 摘要 ——
   实测在 `state/credentials.db` 里搜不到 `wcr_`。
 - `owner` 取自**身份**（token 模式下是 `admin:<口令指纹>`），**不接受请求体覆盖**；`purpose` 必填（进审计）。
