@@ -2458,6 +2458,89 @@ mod tests {
         );
     }
 
+    // ── public_base：配了就信配置，没配才看请求头（2026-11-03 的 404 就是后者丢端口）──
+
+    fn server_with_base(base: Option<&str>) -> ServerConfig {
+        ServerConfig {
+            listen_addr: "127.0.0.1:8443".to_string(),
+            mode: AuthMode::Ingress,
+            ingress_header: OPERATOR_HEADER.to_string(),
+            admin_password_hash: String::new(),
+            trusted_peers: Vec::new(),
+            public_base_url: base.map(str::to_string),
+        }
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_static(value));
+        }
+        map
+    }
+
+    #[test]
+    fn public_base_prefers_the_configured_value_over_the_host_header() {
+        let server = server_with_base(Some("https://cred.example.com:4444"));
+        let headers = headers(&[(header::HOST.as_str(), "other.example.com")]);
+        assert_eq!(
+            public_base(&server, &headers).as_deref(),
+            Some("https://cred.example.com:4444"),
+            "反代写什么 Host 都不能盖过显式配置"
+        );
+    }
+
+    #[test]
+    fn public_base_keeps_the_port_when_derived_from_the_host_header() {
+        let server = server_with_base(None);
+        let headers = headers(&[
+            (header::HOST.as_str(), "cred.example.com:4444"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        assert_eq!(
+            public_base(&server, &headers).as_deref(),
+            Some("https://cred.example.com:4444"),
+            "端口是登记能不能到得了 cred 的关键，不能丢"
+        );
+    }
+
+    #[test]
+    fn public_base_defaults_to_https_except_for_loopback() {
+        let server = server_with_base(None);
+        for (host, want) in [
+            ("cred.example.com", "https://cred.example.com"),
+            ("127.0.0.1:18443", "http://127.0.0.1:18443"),
+            ("localhost:5174", "http://localhost:5174"),
+        ] {
+            let headers = headers(&[(header::HOST.as_str(), host)]);
+            assert_eq!(public_base(&server, &headers).as_deref(), Some(want));
+        }
+    }
+
+    #[test]
+    fn public_base_honours_x_forwarded_proto() {
+        let server = server_with_base(None);
+        let headers = headers(&[
+            (header::HOST.as_str(), "cred.example.com:4444"),
+            ("x-forwarded-proto", "http"),
+        ]);
+        assert_eq!(
+            public_base(&server, &headers).as_deref(),
+            Some("http://cred.example.com:4444")
+        );
+    }
+
+    #[test]
+    fn public_base_refuses_to_build_from_a_bogus_host() {
+        let server = server_with_base(None);
+        for bogus in ["", "evil/host", "a b", "host;rm"] {
+            let headers = headers(&[(header::HOST.as_str(), bogus)]);
+            assert_eq!(public_base(&server, &headers), None, "host={bogus:?}");
+        }
+        // 没有 Host 宁可返回 None（调用方再用空串），也不要拼出一个半残地址。
+        assert_eq!(public_base(&server, &HeaderMap::new()), None);
+    }
+
     #[tokio::test]
     async fn onboarding_peers_need_an_operator() {
         let harness = Harness::new()

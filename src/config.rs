@@ -890,20 +890,45 @@ mod tests {
     fn public_base_url_must_be_absolute_and_keeps_its_port() {
         // 接入脚本里的“交 CSR”地址是服务端拼的绝对地址；相对值拼出来只会在
         // 那台机器上碰巧能用。端口必须原样保留 —— 反代默认的 `$host` 就是把它弄丢的那个。
-        let ok = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\npublic_base_url = \"https://cred.example.com:4444/\"\n";
+        let ok = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\npublic_base_url = \"  https://cred.example.com:4444/  \"\n";
         let config = parse(ok).expect("absolute URL is accepted");
         assert_eq!(
             config.server.public_base_url.as_deref(),
             Some("https://cred.example.com:4444"),
-            "末尾的 `/` 要去掉，否则会拼出 `//enroll/...`"
+            "两端空白与末尾的 `/` 都要去掉，否则会拼出 `//enroll/...`"
         );
 
-        let bad = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\npublic_base_url = \"cred.example.com:4444\"\n";
-        let err = parse(bad).expect_err("relative base must be rejected");
-        assert!(
-            err.to_string().contains("public_base_url"),
-            "unexpected error: {err}"
+        // http 也允许（入口没终止 TLS 的现场）；默认端口的写法不强迫。
+        let plain_http = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\npublic_base_url = \"http://10.0.20.10\"\n";
+        assert_eq!(
+            parse(plain_http)
+                .expect("http is accepted")
+                .server
+                .public_base_url
+                .as_deref(),
+            Some("http://10.0.20.10")
         );
+
+        // 不给就不拼（回落到请求头）。
+        let absent = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\n";
+        assert_eq!(
+            parse(absent)
+                .expect("absent is fine")
+                .server
+                .public_base_url,
+            None
+        );
+
+        for bad in ["cred.example.com:4444", "ftp://cred.example.com", "", "   "] {
+            let text = format!(
+                "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\npublic_base_url = {bad:?}\n"
+            );
+            let err = parse(&text).expect_err("non-absolute base must be rejected");
+            assert!(
+                err.to_string().contains("public_base_url"),
+                "base={bad:?} 的错误信息应指向这个键，got: {err}"
+            );
+        }
     }
 
     #[test]
