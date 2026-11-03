@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### 新增：人机面的验证改由本服务自己做（`mode = "token"`）
+
+以前人身份由内网反代注入 `x-wist-operator`（浏览器 basic auth 弹窗，页面上没有登录框、
+没有登出，也不属于产品）。现在多一个模式，发布态用它：
+
+- `mode = "token"`：页面输口令 → `Authorization: Bearer <口令>` → **本服务验**；
+  配置里只写 `admin_password = "${SEC_CRED_WEB_PASSWORD}"`，加载时算成 `sha256`、明文丢弃。
+  错误码与 gateway 管理面逐字一致（`missing_admin_bearer_token` / `invalid_admin_bearer_token`），
+  页面一套 401 处理能用两处。
+- 审计里的发起人：`admin:<sha256(口令) 前 12 位>`（与 gateway 的 `admin_actor()` 同形）。
+- `mode = "ingress"` 保留（开发态 / 已经有入口认证的场合）。
+- 加载期新增约束：`token` 模式必须有口令（缺失 / 展开不出来都拒启）；
+  S1（不得绑 unspecified 地址）对两种模式都生效。
+- 依赖：`wist-auth`（`bearer_token` / `token_matches` / `sha256_hex`），不再自己写比对。
+
 ## [0.1.1-alpha] - 2026-11-03
 
 ### 变更

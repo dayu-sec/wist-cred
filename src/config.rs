@@ -1,9 +1,17 @@
 //! 分层配置：主配置 + `${VAR}` 展开（与 center / console 同口径，fail-closed）。
 //!
+//! 人机面（页面）的认证有两种模式，**由服务自己验**，不靠反代注入：
+//!
+//! - `mode = "token"`（发布态默认）：页面输口令，请求带 `Authorization: Bearer <口令>`；
+//!   配置里只放口令的 **sha256**（`server.admin_password = "${SEC_CRED_WEB_PASSWORD}"`，
+//!   加载时算完就把明文丢掉），与 gateway / center 的管理面同一个形状。
+//! - `mode = "ingress"`（开发态 / 已经有入口认证的场合）：人身份由内网反代注入 `x-wist-operator`。
+//!
 //! 几条**加载期就拒绝启动**的约束（设计文档 §3.4 的 S1）：
 //!
-//! - `mode = "ingress"` 时 listener 不得绑 `0.0.0.0` / `[::]`——同一份代码绑到公网就是后门；
+//! - listener 不得绑 `0.0.0.0` / `[::]`——同一份代码绑到公网就是后门；
 //! - `mode = "ingress"` 时 `trusted_peers` 不能为空，否则等于谁都能注入操作者头；
+//! - `mode = "token"` 时 `admin_password` 不能为空，否则等于谁都能进页面签发凭据；
 //! - `mode = "oidc"` 是留给用户中心 / 钉钉的位置，**本期不实现**：显式写出来会直接拒绝启动；
 //! - 签发 CA 与推送信任锚必须是同一把 CA，否则会签出自己认不了的证书。
 //!
@@ -37,13 +45,19 @@ pub struct ServerConfig {
     pub listen_addr: String,
     pub mode: AuthMode,
     pub ingress_header: String,
-    /// 允许到达人机面的对端（unix socket 路径 / CIDR / 回环）。空 = 拒绝启动。
+    /// `mode = token` 时页面口令的 **sha256**（十六进制）。明文只在密钥文件里，加载后就丢。
+    pub admin_password_hash: String,
+    /// 允许到达人机面的对端（unix socket 路径 / CIDR / 回环）。
+    /// `ingress` 必填；`token` 可选（可用的第二道锁）。
     pub trusted_peers: Vec<String>,
 }
 
-/// `ingress`：人身份由内网入口（反代 / 跳板）注入；`oidc`：将来接用户中心 / 钉钉。
+/// `token`：页面输口令，服务自己验（发布态）；
+/// `ingress`：人身份由内网入口（反代 / 跳板）注入（开发态）；
+/// `oidc`：将来接用户中心 / 钉钉。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
+    Token,
     Ingress,
     Oidc,
 }
@@ -202,6 +216,9 @@ struct RawServer {
     mode: String,
     #[serde(default = "default_ingress_header")]
     ingress_header: String,
+    /// `mode = token` 时的人人面口令。写 `${SEC_CRED_WEB_PASSWORD}`，真值只在密钥文件里。
+    #[serde(default)]
+    admin_password: Option<String>,
     #[serde(default)]
     trusted_peers: Vec<String>,
 }
@@ -212,6 +229,7 @@ impl Default for RawServer {
             listen_addr: default_listen(),
             mode: default_mode(),
             ingress_header: default_ingress_header(),
+            admin_password: None,
             trusted_peers: Vec::new(),
         }
     }
@@ -357,10 +375,11 @@ fn default_push_timeout() -> u64 {
 impl RawConfig {
     fn resolve(self, env: &EnvDict) -> anyhow::Result<Config> {
         let mode = match self.server.mode.trim() {
+            "token" => AuthMode::Token,
             "ingress" => AuthMode::Ingress,
             // 位置留在这里，但本期不做：写出来就拒绝启动，避免静默退化成"不校验"。
             "oidc" => bail!("server.mode = \"oidc\" is not implemented yet"),
-            other => bail!("server.mode must be ingress|oidc, got {other:?}"),
+            other => bail!("server.mode must be token|ingress|oidc, got {other:?}"),
         };
 
         let listen_addr = expand(env, &self.server.listen_addr)?;
@@ -368,22 +387,44 @@ impl RawConfig {
             bail!("server.listen_addr must not be empty");
         }
 
+        // S1 对两种模式都成立：绑 unspecified 地址的 listener 就是一个“谁都能来”的后门。
+        if is_unspecified_host(listener_host(&listen_addr)) {
+            bail!(
+                "S1: server.listen_addr must not bind an unspecified address ({listen_addr}); \
+                 bind the private address of the ingress/proxy instead"
+            );
+        }
+
         let ingress_header = expand(env, &self.server.ingress_header)?;
-        if mode == AuthMode::Ingress {
-            if ingress_header.trim().is_empty() {
-                bail!("server.ingress_header must not be empty when mode = ingress");
-            }
-            if is_unspecified_host(listener_host(&listen_addr)) {
+        if mode == AuthMode::Ingress && ingress_header.trim().is_empty() {
+            bail!("server.ingress_header must not be empty when mode = ingress");
+        }
+
+        // 页面口令：配置里只有 sha256（跟 gateway / center 的管理面同一个形状）。
+        // 明文从 `${SEC_CRED_WEB_PASSWORD}` 来（密钥文件），算完就丢。
+        let admin_password_hash = if mode == AuthMode::Token {
+            let raw = self.server.admin_password.as_deref().unwrap_or("").trim();
+            if raw.is_empty() {
                 bail!(
-                    "S1: mode = ingress must not bind an unspecified address ({listen_addr}); \
-                     bind the private address of the internal proxy instead"
+                    "server.admin_password must be set when mode = token \
+                     (write `${{SEC_CRED_WEB_PASSWORD}}` here, never the literal)"
                 );
             }
-            if self.server.trusted_peers.is_empty() {
-                bail!("server.trusted_peers must list at least one peer when mode = ingress");
+            let password = expand(env, raw)?;
+            if password.trim().is_empty() {
+                bail!("server.admin_password resolved to an empty value");
             }
-            // 加载期就把写错的规则打回去：否则错一个 CIDR 就是“所有人 401”，
-            // 而且每个请求都会刷一条 warn。
+            wist_auth::sha256_hex(password.trim())
+        } else {
+            String::new()
+        };
+
+        if mode == AuthMode::Ingress && self.server.trusted_peers.is_empty() {
+            bail!("server.trusted_peers must list at least one peer when mode = ingress");
+        }
+        // 两条路都要把写错的规则打回去：否则错一个 CIDR 就是“所有人 401”，
+        // 而且每个请求都会刷一条 warn。（token 模式下 trusted_peers 可为空 = 不做第二道锁。）
+        if !self.server.trusted_peers.is_empty() {
             for rule in &self.server.trusted_peers {
                 let rule = rule.trim();
                 if rule.is_empty() {
@@ -480,6 +521,7 @@ impl RawConfig {
                 listen_addr,
                 mode,
                 ingress_header,
+                admin_password_hash,
                 trusted_peers: self.server.trusted_peers,
             },
             storage: StorageConfig {
@@ -513,6 +555,16 @@ mod tests {
     fn parse(text: &str) -> anyhow::Result<Config> {
         let raw: RawConfig = toml::from_str(text).expect("raw config");
         raw.resolve(&EnvDict::new())
+    }
+
+    /// 带环境（密钥文件 / env）的解析：`mode = token` 的口令就是从这里来的。
+    fn parse_with_env(text: &str, env: &[(&str, &str)]) -> anyhow::Result<Config> {
+        let raw: RawConfig = toml::from_str(text).expect("raw config");
+        let mut dict = EnvDict::new();
+        for (key, value) in env {
+            dict.insert((*key).to_string(), ValueType::from(*value));
+        }
+        raw.resolve(&dict)
     }
 
     const MINIMAL: &str = r#"
@@ -553,6 +605,59 @@ mod tests {
                 "unexpected error for {rule:?}: {err}"
             );
         }
+    }
+
+    const TOKEN_MINIMAL: &str = r#"
+        [server]
+        listen_addr = "10.0.20.11:8443"
+        mode = "token"
+        admin_password = "${SEC_CRED_WEB_PASSWORD}"
+    "#;
+
+    #[test]
+    fn token_mode_loads_the_password_from_the_secret_file() {
+        let password = "0123456789abcdef01234567";
+        let config = parse_with_env(TOKEN_MINIMAL, &[("SEC_CRED_WEB_PASSWORD", password)])
+            .expect("valid token config");
+        assert_eq!(config.server.mode, AuthMode::Token);
+        // 配置里只留 sha256：明文算完就丢（结构体里根本没有存明文的字段）。
+        assert_eq!(
+            config.server.admin_password_hash,
+            wist_auth::sha256_hex(password)
+        );
+        assert_ne!(config.server.admin_password_hash, password);
+        // token 模式下 trusted_peers 可为空（要第二道锁时再写）。
+        assert!(config.server.trusted_peers.is_empty());
+    }
+
+    #[test]
+    fn token_mode_without_a_usable_password_fails_closed() {
+        for text in [
+            "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\n",
+            "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"\"\n",
+        ] {
+            let err = parse(text).expect_err("token mode needs a password");
+            assert!(
+                err.to_string().contains("admin_password"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // 密钥文件里没这个键（展开失败）：必须当场报错，不能静默成空口令。
+        let err = parse("[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"${SEC_MISSING}\"\n")
+            .expect_err("unresolved secret must fail");
+        assert!(
+            err.to_string().contains("SEC_MISSING"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn token_mode_still_refuses_to_bind_an_unspecified_address() {
+        let text =
+            "[server]\nlisten_addr = \"0.0.0.0:8443\"\nmode = \"token\"\nadmin_password = \"x\"\n";
+        let err = parse(text).expect_err("S1 must reject");
+        assert!(err.to_string().contains("S1"), "unexpected error: {err}");
     }
 
     #[test]

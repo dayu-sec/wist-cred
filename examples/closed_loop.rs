@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
             listen_addr: "127.0.0.1:18443".to_string(),
             mode: AuthMode::Ingress,
             ingress_header: OPERATOR_HEADER.to_string(),
+            admin_password_hash: String::new(),
             trusted_peers: vec!["127.0.0.1/32".to_string()],
         },
         storage: StorageConfig {

@@ -15,7 +15,12 @@
 //! | `POST /onboarding/enroll/{token}` | X 交 CSR 换自己的服务器证书（**兑现券**） |
 //! | `GET  /healthz` / `GET /version` | 探针 |
 //!
-//! 人身份来自内网入口注入的操作者头（D17）；对端不在 `trusted_peers` 内直接拒绝（S3）。
+//! 人身份由**本服务自己验**（`server.mode`）：
+//!
+//!   - `token`（发布态）：页面输口令 → `Authorization: Bearer <口令>`，配置里只存口令的 sha256；
+//!   - `ingress`（开发态 / 已经有入口认证的场合）：由内网反代注入 `x-wist-operator`。
+//!
+//! 两种模式下都可以再用 `trusted_peers` 收窄对端（空 = 不限）。
 //! **两条不走人机认证**：取脚本、交 CSR。取它们的是 X（机器），它没有操作者；
 //! 授权依据是 URL 里那张一次性券，且在兑现（`enroll`）时作废。
 //!
@@ -147,7 +152,8 @@ async fn landing() -> impl IntoResponse {
             "GET  /onboarding/script/{token}",
             "POST /onboarding/enroll/{token}",
         ],
-        "auth": "requests under /api/v1 need the operator header injected by the ingress; \
+        "auth": "requests under /api/v1 need `Authorization: Bearer <password>` in token mode \
+                 (the page asks for it), or the operator header injected by the ingress in ingress mode; \
                  /onboarding/{script,enroll}/{token} are authorised by the one-time ticket itself \
                  (script: re-fetchable, enroll: single use)",
     }))
@@ -1205,9 +1211,14 @@ impl Denied {
     }
 }
 
-/// 人机面的授权：peer 必须在 `trusted_peers` 内（S3），且必须带操作者头（D17）。
+/// 人机面的授权。两条路（见 `mode`）：
+///
+/// - `token`：验 `Authorization: Bearer <口令>`（sha256 常量时间），返回 `admin:<指纹>`；
+/// - `ingress`：要求 `x-wist-operator` 头（由内网反代注入），返回操作者名。
+///
+/// `trusted_peers` 非空时先过这一道（S3）。
 fn authorize(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> Result<String, Denied> {
-    if !peer_allowed(config, peer.ip()) {
+    if !config.server.trusted_peers.is_empty() && !peer_allowed(config, peer.ip()) {
         log::warn!("untrusted ingress peer rejected: {peer}");
         return Err(Denied::new(
             StatusCode::UNAUTHORIZED,
@@ -1215,13 +1226,43 @@ fn authorize(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> Result<S
             "peer is not in server.trusted_peers",
         ));
     }
-    if config.server.mode != AuthMode::Ingress {
-        return Err(Denied::new(
+    match config.server.mode {
+        AuthMode::Token => authorize_password(config, headers),
+        AuthMode::Ingress => authorize_ingress(config, headers),
+        AuthMode::Oidc => Err(Denied::new(
             StatusCode::UNAUTHORIZED,
             "unsupported_auth_mode",
-            "only ingress mode is implemented",
+            "oidc mode is not implemented",
+        )),
+    }
+}
+
+/// `mode = token`：页面口令的 Bearer。
+///
+/// 错误码与 gateway 的管理面逐字一致（`missing_admin_bearer_token` /
+/// `invalid_admin_bearer_token`），这样页面一套 401 处理能用两处：
+/// 收到 `invalid_*` 就把本地口令清掉，而不是拿错的密码每 10s 轮询一次。
+fn authorize_password(config: &Config, headers: &HeaderMap) -> Result<String, Denied> {
+    let Some(password) = wist_auth::bearer_token(headers) else {
+        return Err(Denied::new(
+            StatusCode::UNAUTHORIZED,
+            "missing_admin_bearer_token",
+            "missing admin bearer token",
+        ));
+    };
+    if !wist_auth::token_matches(password, &config.server.admin_password_hash) {
+        log::warn!("invalid admin password presented");
+        return Err(Denied::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_admin_bearer_token",
+            "invalid admin bearer token",
         ));
     }
+    Ok(admin_actor(&config.server.admin_password_hash))
+}
+
+/// `mode = ingress`：操作者头由内网反代注入。
+fn authorize_ingress(config: &Config, headers: &HeaderMap) -> Result<String, Denied> {
     let operator = headers
         .get(config.server.ingress_header.as_str())
         .and_then(|value| value.to_str().ok())
@@ -1237,6 +1278,24 @@ fn authorize(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> Result<S
                 config.server.ingress_header
             ),
         )),
+    }
+}
+
+/// 令牌模式下，审计里的“发起人”。
+///
+/// 为什么不写口令、也不写 `admin` 一个词：
+///
+///   - 写口令就是让凭据又多落一处（日志）；
+///   - 只写 `admin` 就分不出“换过口令前后”的操作。
+///
+/// 取 `sha256(口令)` 的前 12 个 hex 当**指纹**：能区分、不能反推。字段形状与 gateway 的
+/// `admin_actor()` 一致（那边将来有用户体系就换成 `user:<id>`，这里同）。
+fn admin_actor(password_hash: &str) -> String {
+    let fingerprint: String = password_hash.chars().take(12).collect();
+    if fingerprint.is_empty() {
+        "admin:unknown".to_string()
+    } else {
+        format!("admin:{fingerprint}")
     }
 }
 
@@ -1344,6 +1403,7 @@ fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
 
 fn mode_name(mode: AuthMode) -> &'static str {
     match mode {
+        AuthMode::Token => "token",
         AuthMode::Ingress => "ingress",
         AuthMode::Oidc => "oidc",
     }
@@ -1392,16 +1452,32 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_server(ServerConfig {
+                listen_addr: "127.0.0.1:8443".to_string(),
+                mode: AuthMode::Ingress,
+                ingress_header: OPERATOR_HEADER.to_string(),
+                admin_password_hash: String::new(),
+                trusted_peers: vec!["127.0.0.1/32".to_string()],
+            })
+        }
+
+        /// 发布态的形态：页面口令（`mode = token`），配置里只有 sha256。
+        fn new_token(password: &str) -> Self {
+            Self::with_server(ServerConfig {
+                listen_addr: "127.0.0.1:8443".to_string(),
+                mode: AuthMode::Token,
+                ingress_header: OPERATOR_HEADER.to_string(),
+                admin_password_hash: wist_auth::sha256_hex(password),
+                trusted_peers: Vec::new(),
+            })
+        }
+
+        fn with_server(server: ServerConfig) -> Self {
             let dir = TempDir::new();
             let peers =
                 Arc::new(PeerRegistry::open(dir.path.join("peers.json")).expect("open registry"));
             let config = Config {
-                server: ServerConfig {
-                    listen_addr: "127.0.0.1:8443".to_string(),
-                    mode: AuthMode::Ingress,
-                    ingress_header: OPERATOR_HEADER.to_string(),
-                    trusted_peers: vec!["127.0.0.1/32".to_string()],
-                },
+                server,
                 storage: StorageConfig {
                     path: dir.path.join("credentials.db"),
                 },
@@ -1511,8 +1587,15 @@ mod tests {
             body: Option<Value>,
         ) -> (StatusCode, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
-            if let Some(operator) = operator {
-                builder = builder.header(OPERATOR_HEADER, operator);
+            // 测试的调用点早就把“人”作为第 3 个参数传进来了：ingress 模式当操作者头，
+            // token 模式当页面口令 —— 两边都是“谁在动这个页面”。
+            if let Some(credential) = operator {
+                builder = match self.state.config.server.mode {
+                    AuthMode::Token => {
+                        builder.header("authorization", format!("Bearer {credential}"))
+                    }
+                    _ => builder.header(OPERATOR_HEADER, credential),
+                };
             }
             let request = match body {
                 Some(body) => builder
@@ -1549,8 +1632,13 @@ mod tests {
             peer: &str,
         ) -> (StatusCode, String) {
             let mut builder = Request::builder().method(method).uri(uri);
-            if let Some(operator) = operator {
-                builder = builder.header(OPERATOR_HEADER, operator);
+            if let Some(credential) = operator {
+                builder = match self.state.config.server.mode {
+                    AuthMode::Token => {
+                        builder.header("authorization", format!("Bearer {credential}"))
+                    }
+                    _ => builder.header(OPERATOR_HEADER, credential),
+                };
             }
             let mut request = builder.body(Body::empty()).unwrap();
             let peer: SocketAddr = format!("{peer}:40000").parse().unwrap();
@@ -1667,6 +1755,65 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "missing_operator");
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_missing_and_wrong_passwords() {
+        const PASSWORD: &str = "0123456789abcdef01234567";
+        let harness = Harness::new_token(PASSWORD);
+
+        // 没带凭据（页面还没输口令）
+        let (status, body) = harness
+            .call("GET", "/api/v1/credentials", None, "127.0.0.1", None)
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "missing_admin_bearer_token");
+
+        // 口令不对：必须是 `invalid_*` —— 页面靠这个码把错的本地口令清掉。
+        let (status, body) = harness
+            .call(
+                "GET",
+                "/api/v1/credentials",
+                Some("wrong-password"),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "invalid_admin_bearer_token");
+    }
+
+    #[tokio::test]
+    async fn token_mode_accepts_the_page_password() {
+        const PASSWORD: &str = "0123456789abcdef01234567";
+        let harness = Harness::new_token(PASSWORD);
+
+        let (status, body) = harness
+            .call(
+                "POST",
+                "/api/v1/credentials",
+                Some(PASSWORD),
+                "127.0.0.1",
+                Some(create_body()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // 审计里的“发起人”是指纹，既不是口令，也不是笼统的 admin。
+        let owner = body["owner"].as_str().expect("owner");
+        let fingerprint: String = wist_auth::sha256_hex(PASSWORD).chars().take(12).collect();
+        assert_eq!(owner, format!("admin:{fingerprint}"));
+        assert!(!owner.contains(PASSWORD));
+    }
+
+    #[tokio::test]
+    async fn token_mode_still_serves_the_health_probe_without_a_password() {
+        // 探针/落地页不该要口令：容器健康检查、反代保活都靠它们。
+        let harness = Harness::new_token("0123456789abcdef01234567");
+        let (status, _) = harness
+            .call("GET", "/healthz", None, "127.0.0.1", None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

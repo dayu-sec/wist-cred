@@ -38,7 +38,7 @@ Wist **凭据服务**（设计文档里的 **C**）。
 
 ```sh
 curl -s -X POST https://cred.internal/api/v1/credentials \
-  -H 'x-wist-operator: alice' \
+  -H 'authorization: Bearer <页面口令>' \
   -H 'content-type: application/json' \
   -d '{
     "subject": "ci-nightly",
@@ -49,10 +49,14 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
   }'
 ```
 
-- `x-wist-operator` 由**内网入口**注入，客户端不自己填（外部同名头会被入口剥离）。
+- **人机面怎么验**（`server.mode`）：
+  - `token`（发布态）：上面的 `Authorization: Bearer <页面口令>` —— 页面里输的那把，
+    配置里只写 `admin_password = "${SEC_CRED_WEB_PASSWORD}"`，加载时算成 sha256、明文丢弃；
+  - `ingress`（开发态）：人身份由内网反代注入 `x-wist-operator`，客户端不自己填。
+- 两种模式下都可以再叠 `trusted_peers`（来源 IP 白名单）当第二道锁。
 - 响应里的 `token`（`wcr_...`）**只此一次**；磁盘只留 `sha256` 摘要 ——
   实测在 `state/credentials.db` 里搜不到 `wcr_`。
-- `owner` 取自注入头，**不接受请求体覆盖**；`purpose` 必填（进审计）。
+- `owner` 取自**身份**（token 模式下是 `admin:<口令指纹>`），**不接受请求体覆盖**；`purpose` 必填（进审计）。
 
 ### 约束
 

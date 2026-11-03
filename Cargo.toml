@@ -28,11 +28,14 @@ wist-pki = "0.1.2"
 # 配置里的 `${SEC_...}`：与其它服务同口径（env 优先，其次 `.galaxy/sec_value.yml`）。
 orion-sec = "0.7"
 orion-variate = "0.14"
+# 管理凭据的比对原语（与控制台 / center / gwlinkd 同一套）：
+# `bearer_token` + `token_matches`（sha256 常量时间比较）。**不自己另写一份。**
+wist-auth = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"
 # 测试里要造真的 CSR（与 gwlinkd 同一套：私钥不上送，只交公钥）。
 rcgen = { version = "0.13", features = ["pem"] }
 tower = { version = "0.5", features = ["util"] }
-# 本地 path 联调：闭环测试要拿验证侧的真实实现来验，不是一个 mock。
-wist-auth = { path = "../wist-auth", default-features = false, features = ["credential"] }
+# 验证侧的真实实作（闭环测试要拿它验，不是一个 mock）。
+wist-auth = { version = "0.2", default-features = false, features = ["credential"] }
