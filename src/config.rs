@@ -74,6 +74,113 @@ pub struct IssueConfig {
     pub max_ttl_seconds: u64,
     pub break_glass_max_ttl_seconds: u64,
     pub overlap_seconds: u64,
+    /// 授权记录的签发私钥（Ed25519，PKCS#8）。`None` = 不签名（下游开了
+    /// `require_signature` 时会拒收，所以生产必须配）。
+    pub signing_key: Option<SigningKey>,
+}
+
+/// 授权记录的**签发钥**。私钥只在内存里，`Debug` 永远不打印内容。
+#[derive(Clone)]
+pub struct SigningKey {
+    pkcs8: Vec<u8>,
+    public: Vec<u8>,
+}
+
+impl std::fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("public_hex", &self.public_hex())
+            .field("private", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SigningKey {
+    /// 读 PKCS#8 私钥（PEM 或 DER）。同时导出公钥，供接入包下发。
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    log::warn!(
+                        "issue.signing_key {} is accessible by group/others (mode {mode:o}); chmod 600",
+                        path.display()
+                    );
+                }
+            }
+        }
+        let raw = std::fs::read(path)
+            .with_context(|| format!("read issue.signing_key {}", path.display()))?;
+        let der = if raw.starts_with(b"-----BEGIN") {
+            // 只做最小 PEM 包装剥离：Ed25519 私钥是单段 base64，无加密头。
+            let text = String::from_utf8(raw)
+                .with_context(|| format!("{} is not UTF-8 PEM", path.display()))?;
+            let mut base64 = String::new();
+            let mut inside = false;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with("-----BEGIN") {
+                    inside = true;
+                    continue;
+                }
+                if line.starts_with("-----END") {
+                    break;
+                }
+                if inside {
+                    base64.push_str(line);
+                }
+            }
+            base64_decode(&base64)
+                .with_context(|| format!("decode PEM body of {}", path.display()))?
+        } else {
+            raw
+        };
+        Self::from_pkcs8(der)
+    }
+
+    /// 从 PKCS#8 DER 构造（也供测试用）。
+    pub fn from_pkcs8(der: Vec<u8>) -> anyhow::Result<Self> {
+        let public = wist_auth::signing::public_key_from_pkcs8(&der)
+            .map_err(|err| anyhow::anyhow!("invalid issue.signing_key: {err}"))?;
+        Ok(Self { pkcs8: der, public })
+    }
+
+    /// 对一条授权记录签名（小写 hex）。
+    pub fn sign(&self, entry: &wist_auth::credential::CredentialEntry) -> anyhow::Result<String> {
+        wist_auth::signing::sign(entry, &self.pkcs8).map_err(|err| anyhow::anyhow!(err))
+    }
+
+    /// 裸公钥的 hex（32 字节），写进接入包给验证方。
+    pub fn public_hex(&self) -> String {
+        wist_auth::signing::encode_hex(&self.public)
+    }
+}
+
+/// 最小 base64 解码（只用在本文件的 PEM 读取上，避免多一个依赖）。
+fn base64_decode(text: &str) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for ch in text.chars() {
+        let value = match ch {
+            'A'..='Z' => ch as u32 - 'A' as u32,
+            'a'..='z' => ch as u32 - 'a' as u32 + 26,
+            '0'..='9' => ch as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            '=' | '\n' | '\r' | ' ' | '\t' => continue,
+            other => anyhow::bail!("invalid base64 character {other:?}"),
+        };
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// 推送：每个认证系统共用这一套身份与信任锚，只有 URL 不同。
@@ -261,6 +368,9 @@ struct RawIssue {
     break_glass_max_ttl_seconds: u64,
     #[serde(default = "default_overlap")]
     overlap_seconds: u64,
+    /// 授权记录的签发私钥（Ed25519，PKCS#8 / PEM）。
+    #[serde(default)]
+    signing_key: Option<PathBuf>,
 }
 
 impl Default for RawIssue {
@@ -270,6 +380,7 @@ impl Default for RawIssue {
             max_ttl_seconds: default_max_ttl(),
             break_glass_max_ttl_seconds: default_break_glass_ttl(),
             overlap_seconds: default_overlap(),
+            signing_key: None,
         }
     }
 }
@@ -470,6 +581,11 @@ impl RawConfig {
             Ok(PathBuf::from(expand(env, &value.to_string_lossy())?))
         };
 
+        let signing_key = match self.issue.signing_key.as_ref() {
+            Some(path) => Some(SigningKey::load(&path_of(path)?)?),
+            None => None,
+        };
+
         let push = match self.push {
             Some(raw) => {
                 if raw.timeout_seconds == 0 {
@@ -544,6 +660,7 @@ impl RawConfig {
                 max_ttl_seconds: self.issue.max_ttl_seconds,
                 break_glass_max_ttl_seconds: self.issue.break_glass_max_ttl_seconds,
                 overlap_seconds: self.issue.overlap_seconds,
+                signing_key,
             },
             push,
             onboarding: OnboardingConfig {

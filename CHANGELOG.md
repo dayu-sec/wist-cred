@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.4.0-alpha] - 2026-11-03
+
+### 新增：授权记录签名（Ed25519）
+
+- `[issue].signing_key`：授权记录的签发私钥（PKCS#8/PEM，推荐 Ed25519）。
+  推送 `register` 时对整条授权内容签名；`revoke` 也对“已撤销的记录”重新签名。
+- 签名覆盖：凭据指纹、程序名、角色、资源、受众、有效期、版本号、撤销状态。
+  验证方改任何一项都无法通过验签（收到的和磁盘上加载的各验一次）。
+- 接入脚本追加下发 `issuer-signing.pub`（裸 32 字节 hex 公钥）——验证方只拿公开材料，
+  私钥永远不出 cred。
+- 示例验证方新增 `--issuer-public-key <hex>` / `--issuer-public-key-file <path>`：
+  给了就开验签；`wist-cred-stack` 的 demo peer 已接上（缺文件时降级为不验签并提示）。
+- `scripts/gen-pki.sh` 首次运行生成 `identity/cred/signing.key`（已存在不重签）；
+  `scripts/init-cred.sh` 也会补生成，并派生公开的 `signing.pub`。
+- 私钥文件被 group/others 可读时启动期告警（建议 `0600`）。
+- 没配 `signing_key` 时仍可签发，但推送的是未签名记录：验证方开了 `require_signature`
+  会拒收，启动日志会明确告警。
+
+### 升级注意
+
+- 配合 `wist-auth 0.3` / `wist-cred-peer 0.2`。
+- **验证方要先升**（peer 0.2，先保持 `require_signature = false`），再升 cred，最后开启验签：
+  peer 0.1 的撤销请求体是 `deny_unknown_fields`，新 cred 多发的字段会被旧验证方拒掉。
+- 已有验证方需要**重新跑一次接入命令**，把 `issuer-signing.pub` 补下来；旧记录没有签名，
+  开启验签后会被丢弃，需要在 cred 页面「重推」。
+
 ## [0.3.0-alpha] - 2026-11-03
 
 ### 新增：示例验证方（`wist-cred-example` 镜像）

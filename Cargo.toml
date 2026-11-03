@@ -1,6 +1,6 @@
 [package]
 name = "wist-cred"
-version = "0.3.0" #@gxl:set(version)
+version = "0.4.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["wist Dev Team"]
@@ -34,10 +34,12 @@ orion-variate = "0.14"
 # 多 crate 联调口径与 dev-dependency 一致：用**本地 path**（仓组同级摆放），
 # 不在 runtime 引入一份 registry 副本 —— 否则两处版本一漂，“验的人”和“签的人”就会说两套话。
 # 镜像由 release 用**预编译二进制**打（docker/Dockerfile），不依赖这份 path。
-wist-auth = { path = "../wist-auth", default-features = false }
+wist-auth = { path = "../wist-auth", default-features = false, features = ["credential", "signing"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+# 测试里现生成 Ed25519 钥，验证推送载荷的签名契约。
+ring = "0.17"
 # 测试里要造真的 CSR（与 gwlinkd 同一套：私钥不上送，只交公钥）。
 rcgen = { version = "0.13", features = ["pem"] }
 tower = { version = "0.5", features = ["util"] }
@@ -46,7 +48,8 @@ tower = { version = "0.5", features = ["util"] }
 wist-auth = { path = "../wist-auth", default-features = false, features = ["credential"] }
 # 示例验证方依赖**已发布**的 `wist-cred-peer`（不引本地 path）：它就是“下游怎么接”的样板。
 # 它只用于 example / 镜像 `wist-cred-example`，不进服务二进制。
-wist-cred-peer = "0.1"
+# 0.2：支持授权记录验签（`--issuer-public-key`）。
+wist-cred-peer = "0.2"
 
 # 示例验证方（X）：一个真能跑的双向认证服务，release 会把它打成 `wist-cred-example` 镜像。
 [[example]]

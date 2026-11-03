@@ -112,9 +112,19 @@ impl TicketStore {
 ///
 /// `enroll_url` 是**绝对地址**（页面按请求的 Host / X-Forwarded-Proto 拼出来），
 /// 脚本里可以用 `--endpoint <base>` 覆盖。
-pub fn render_script(peer: &Peer, client_ca_pem: &str, enroll_url: &str) -> anyhow::Result<String> {
+pub fn render_script(
+    peer: &Peer,
+    client_ca_pem: &str,
+    enroll_url: &str,
+    issuer_public_hex: Option<&str>,
+) -> anyhow::Result<String> {
     if !client_ca_pem.contains("-----BEGIN") {
         anyhow::bail!("client CA is not a PEM");
+    }
+    if let Some(hex) = issuer_public_hex
+        && (hex.len() != 64 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        anyhow::bail!("issuer signing public key must be 32-byte hex");
     }
     Ok(TEMPLATE
         .replace("__PEER_NAME__", &shell_single_quoted(&peer.name))
@@ -128,6 +138,7 @@ pub fn render_script(peer: &Peer, client_ca_pem: &str, enroll_url: &str) -> anyh
             &shell_single_quoted(&peer.roles.join(",")),
         )
         .replace("__ENROLL_URL__", &shell_single_quoted(enroll_url))
+        .replace("__ISSUER_SIGNING_PUB__", issuer_public_hex.unwrap_or(""))
         .replace("__CLIENT_CA_PEM__", client_ca_pem.trim_end()))
 }
 
@@ -241,8 +252,13 @@ mod tests {
             created_by: "alice".to_string(),
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
-        let script = render_script(&peer, ca, "https://cred.internal/onboarding/enroll/wot_x")
-            .expect("render");
+        let script = render_script(
+            &peer,
+            ca,
+            "https://cred.internal/onboarding/enroll/wot_x",
+            Some(&"ab".repeat(32)),
+        )
+        .expect("render");
 
         assert!(script.contains("PEER_NAME='wist-ingest'"));
         assert!(script.contains("PEER_HOST='ingest.internal'"));
@@ -279,7 +295,7 @@ mod tests {
             created_by: "alice".to_string(),
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
-        let script = render_script(&peer, ca, "https://cred.internal/x").expect("render");
+        let script = render_script(&peer, ca, "https://cred.internal/x", None).expect("render");
         assert!(
             script.contains(r"PEER_ROLES='read,weird'\''role'"),
             "role quote must be escaped, got: {script}"
@@ -301,7 +317,28 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
         };
-        let err = render_script(&peer, "not a pem", "https://x/y").expect_err("must reject");
+        let err = render_script(&peer, "not a pem", "https://x/y", None).expect_err("must reject");
         assert!(err.to_string().contains("not a PEM"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn issuer_public_key_is_embedded_and_validated() {
+        let peer = Peer {
+            name: "wist-ingest".to_string(),
+            host: Some("ingest.internal".to_string()),
+            endpoint: None,
+            healthz: None,
+            roles: Vec::new(),
+            created_at: 0,
+            created_by: "alice".to_string(),
+        };
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let hex = "ab".repeat(32);
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", Some(&hex)).expect("render");
+        assert!(script.contains(&hex), "public key must be embedded");
+        let err = render_script(&peer, ca, "https://cred.internal/x", Some("zz"))
+            .expect_err("must reject");
+        assert!(err.to_string().contains("hex"), "unexpected: {err}");
     }
 }

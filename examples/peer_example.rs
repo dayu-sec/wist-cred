@@ -34,6 +34,10 @@ struct Args {
     roles: Vec<String>,
     max_ttl: BTreeMap<String, i64>,
     base_path: String,
+    /// 签发方 Ed25519 公钥（裸 32 字节 hex）；给了它 = 要求每条授权记录带签名。
+    issuer_public_key: Option<String>,
+    /// 从文件读公钥（接入包落下的 `issuer-signing.pub`）。
+    issuer_public_key_file: Option<PathBuf>,
     verify_endpoint: bool,
 }
 
@@ -77,6 +81,26 @@ async fn run(args: Args) -> ExitCode {
     for (role, seconds) in &args.max_ttl {
         config = config.max_ttl(role, *seconds);
     }
+    let issuer_public_key = match (&args.issuer_public_key, &args.issuer_public_key_file) {
+        (Some(hex), _) => Some(hex.clone()),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(text) => Some(text.trim().to_string()),
+            Err(err) => {
+                eprintln!("read {}: {err}", path.display());
+                return ExitCode::from(2);
+            }
+        },
+        (None, None) => None,
+    };
+    if let Some(hex) = &issuer_public_key {
+        config = match config.require_signature(true).issuer_public_key_hex(hex) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("invalid --issuer-public-key: {err}");
+                return ExitCode::from(2);
+            }
+        };
+    }
 
     let peer = match Peer::open(config) {
         Ok(peer) => peer,
@@ -105,6 +129,14 @@ async fn run(args: Args) -> ExitCode {
         println!("  verify     POST https://{listen}/verify        （仅联调）");
     }
     println!("  签发方白名单  {:?}", args.issuers);
+    println!(
+        "  授权记录验签  {}",
+        if issuer_public_key.is_some() {
+            "on"
+        } else {
+            "off（--issuer-public-key 打开）"
+        }
+    );
     println!("  可验角色      {:?}", args.roles);
     println!("  摘要表        {}", args.store.display());
     println!();
@@ -153,6 +185,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
         roles: Vec::new(),
         max_ttl: BTreeMap::new(),
         base_path: DEFAULT_BASE_PATH.to_string(),
+        issuer_public_key: None,
+        issuer_public_key_file: None,
         verify_endpoint: false,
     };
 
@@ -192,6 +226,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 parsed.max_ttl.insert(role.trim().to_string(), seconds);
             }
             "--base-path" => parsed.base_path = value(&mut args, "--base-path")?,
+            "--issuer-public-key" => {
+                parsed.issuer_public_key = Some(value(&mut args, "--issuer-public-key")?)
+            }
+            "--issuer-public-key-file" => {
+                parsed.issuer_public_key_file =
+                    Some(PathBuf::from(value(&mut args, "--issuer-public-key-file")?))
+            }
             "--verify-endpoint" => parsed.verify_endpoint = true,
             "-h" | "--help" => return Err("help".to_string()),
             other => return Err(format!("unknown flag {other:?}")),
@@ -223,5 +264,7 @@ fn usage() -> &'static str {
   --known-roles <a,b>    本服务能验的角色
   --max-ttl <role=secs>  角色有效期上限，可重复
   --base-path <path>     接收路径前缀（默认 /api/v1/internal/credentials）
+  --issuer-public-key <hex>  签发方 Ed25519 公钥（裸 32 字节 hex；给了就要求验签）
+  --issuer-public-key-file <path>  从文件读公钥（接入包落下的 issuer-signing.pub）
   --verify-endpoint      额外挂 POST /verify（仅联调）"
 }

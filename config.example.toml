@@ -43,6 +43,9 @@ digest = "sha256"
 max_ttl_seconds = 2592000              # 30d（脚本）
 break_glass_max_ttl_seconds = 7776000  # 90d
 overlap_seconds = 300
+# 授权记录的签发钥（Ed25519，PKCS#8/PEM）。公钥随接入包下发，X 用它验每条记录。
+# 不配 = 不签名；下游开了 require_signature 会拒收（生产必须配）。
+signing_key = "/etc/wist/cred/signing.key"
 
 # ── 推送：一套身份，所有认证系统共用 ────────────────────────────────────
 # 两个方向不是同一把 CA：client_* 由 CA-I 签（证明"我是 cred"），

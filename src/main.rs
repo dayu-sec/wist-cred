@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
                 &push.client_key,
                 &push.ca,
                 Duration::from_secs(push.timeout_seconds),
+                config.issue.signing_key.clone(),
             )
             .context("build push client (mutual TLS)")?,
         )),
@@ -67,15 +68,22 @@ async fn main() -> anyhow::Result<()> {
 
     let peer_count = peers.list().len();
     log::info!(
-        "wist-cred starting: listen={} mode={:?} storage={} peers={} push={} signing={} heartbeat={}s",
+        "wist-cred starting: listen={} mode={:?} storage={} peers={} push={} peer_signing={} record_signing={} heartbeat={}s",
         config.server.listen_addr,
         config.server.mode,
         config.storage.path.display(),
         peer_count,
         push.is_some(),
         signer.is_some(),
+        config.issue.signing_key.is_some(),
         config.onboarding.heartbeat_seconds
     );
+    if push.is_some() && config.issue.signing_key.is_none() {
+        log::warn!(
+            "[issue].signing_key is not set: pushed authorization records are unsigned; \
+             verifiers with require_signature = true will reject them"
+        );
+    }
     for peer in peers.list() {
         log::info!(
             "auth system: name={} host={:?} endpoint={:?}",

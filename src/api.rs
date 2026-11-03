@@ -445,7 +445,18 @@ async fn fetch_script(
         "{}/onboarding/enroll/{token}",
         public_base(&headers).unwrap_or_default()
     );
-    match crate::onboarding::render_script(&target, &client_ca, &enroll_url) {
+    let issuer_public = state
+        .config
+        .issue
+        .signing_key
+        .as_ref()
+        .map(|key| key.public_hex());
+    match crate::onboarding::render_script(
+        &target,
+        &client_ca,
+        &enroll_url,
+        issuer_public.as_deref(),
+    ) {
         Ok(script) => {
             log::info!(
                 "onboarding script served: peer={} peer_addr={peer}",
@@ -1052,12 +1063,10 @@ async fn revoke_credential(
                 let mut tasks = tokio::task::JoinSet::new();
                 for (name, endpoint) in state.peers.by_endpoint() {
                     let push = push.clone();
-                    let credential_id = record.credential_id.clone();
-                    let revision = record.revision;
+                    // 推送的签名必须覆盖“已撤销”的完整记录，所以整条记录一起带进任务。
+                    let record = record.clone();
                     tasks.spawn(async move {
-                        let outcome = push
-                            .revoke(&name, &endpoint, &credential_id, revision)
-                            .await;
+                        let outcome = push.revoke(&name, &endpoint, &record).await;
                         (name, outcome)
                     });
                 }
@@ -1505,6 +1514,7 @@ mod tests {
                     max_ttl_seconds: 2_592_000,
                     break_glass_max_ttl_seconds: 7_776_000,
                     overlap_seconds: 300,
+                    signing_key: None,
                 },
                 push: None,
                 onboarding: OnboardingConfig {

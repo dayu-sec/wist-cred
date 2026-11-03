@@ -17,12 +17,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use reqwest::{Certificate, Client, Identity};
 use serde_json::json;
+use wist_auth::credential::CredentialEntry;
 
+use crate::config::SigningKey;
 use crate::store::CredentialRecord;
 
 pub struct Pusher {
     client: Client,
     timeout: Duration,
+    /// 授权记录的签发钥：有它就签名，`None` 则下游开了 `require_signature` 会拒收。
+    signing: Option<SigningKey>,
 }
 
 impl Pusher {
@@ -32,6 +36,7 @@ impl Pusher {
         client_key: &Path,
         ca: &Path,
         timeout: Duration,
+        signing: Option<SigningKey>,
     ) -> anyhow::Result<Self> {
         let anchor =
             std::fs::read(ca).with_context(|| format!("read trust anchor {}", ca.display()))?;
@@ -58,7 +63,35 @@ impl Pusher {
             .build()
             .context("build push HTTP client")?;
 
-        Ok(Self { client, timeout })
+        Ok(Self {
+            client,
+            timeout,
+            signing,
+        })
+    }
+
+    /// 把本地记录折成可签名的形状（与验证方 `CredentialEntry` 同构）。
+    fn entry_of(record: &CredentialRecord) -> CredentialEntry {
+        CredentialEntry {
+            credential_id: record.credential_id.clone(),
+            digest: record.digest.clone(),
+            subject: record.subject.clone(),
+            roles: record.roles.clone(),
+            resources: record.resources.clone(),
+            audience: record.audience.clone(),
+            issued_at: record.issued_at,
+            expires_at: record.expires_at,
+            revision: record.revision,
+            revoked_at: record.revoked_at,
+            signature: None,
+        }
+    }
+
+    fn signature_for(&self, record: &CredentialRecord) -> anyhow::Result<Option<String>> {
+        match &self.signing {
+            Some(signing) => Ok(Some(signing.sign(&Self::entry_of(record))?)),
+            None => Ok(None),
+        }
     }
 
     /// 登记一条凭据。失败意味着"对方没认"，调用方据此决定要不要交付明文。
@@ -68,7 +101,7 @@ impl Pusher {
         endpoint: &str,
         record: &CredentialRecord,
     ) -> anyhow::Result<()> {
-        let body = json!({
+        let mut body = json!({
             "credential_id": record.credential_id,
             "digest": format!("sha256:{}", record.digest),
             "subject": record.subject,
@@ -80,6 +113,9 @@ impl Pusher {
             "revision": record.revision,
             "revoked_at": record.revoked_at,
         });
+        if let Some(signature) = self.signature_for(record)? {
+            body["signature"] = json!(signature);
+        }
 
         let response = self
             .client
@@ -108,11 +144,21 @@ impl Pusher {
         &self,
         peer: &str,
         endpoint: &str,
-        credential_id: &str,
-        revision: u64,
+        record: &CredentialRecord,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/{credential_id}/revoke", endpoint.trim_end_matches('/'));
-        let body = json!({ "revision": revision });
+        let url = format!(
+            "{}/{}/revoke",
+            endpoint.trim_end_matches('/'),
+            record.credential_id
+        );
+        let mut body = json!({
+            "revision": record.revision,
+            "revoked_at": record.revoked_at,
+        });
+        // 签名覆盖“已撤销的那条记录”：验证方会用它替换旧签名。
+        if let Some(signature) = self.signature_for(record)? {
+            body["signature"] = json!(signature);
+        }
         let response = self
             .client
             .post(&url)
@@ -144,5 +190,64 @@ impl Pusher {
             bail!("probe {url} returned HTTP {status}");
         }
         Ok(started.elapsed().as_millis() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ring::rand::SystemRandom;
+    use ring::signature::Ed25519KeyPair;
+
+    use super::*;
+
+    fn record() -> CredentialRecord {
+        CredentialRecord {
+            credential_id: "cred_1".to_string(),
+            digest: "aa".repeat(32),
+            subject: "ci-nightly".to_string(),
+            owner: "alice".to_string(),
+            purpose: "test".to_string(),
+            roles: vec!["read".to_string()],
+            resources: BTreeMap::new(),
+            audience: "wist-center".to_string(),
+            break_glass: false,
+            issued_at: 1_700_000_000,
+            expires_at: 1_700_003_600,
+            revision: 1,
+            revoked_at: None,
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn pushed_record_signature_covers_authorization_content() {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keypair");
+        let key = SigningKey::from_pkcs8(pkcs8.as_ref().to_vec()).expect("signing key");
+        let public = wist_auth::signing::decode_hex(&key.public_hex()).expect("public hex");
+
+        let entry = Pusher::entry_of(&record());
+        let signature = key.sign(&entry).expect("sign");
+        assert!(
+            wist_auth::signing::verify(&entry, &signature, std::slice::from_ref(&public)),
+            "the pushed signature must verify"
+        );
+
+        // 改角色 / 延长有效期 → 同一个签名不再成立。
+        let mut escalated = entry.clone();
+        escalated.roles.push("admin".to_string());
+        assert!(!wist_auth::signing::verify(
+            &escalated,
+            &signature,
+            std::slice::from_ref(&public)
+        ));
+        let mut extended = entry;
+        extended.expires_at += 86_400;
+        assert!(!wist_auth::signing::verify(
+            &extended,
+            &signature,
+            std::slice::from_ref(&public)
+        ));
     }
 }

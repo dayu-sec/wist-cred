@@ -2714,9 +2714,10 @@ dependencies = [
 
 [[package]]
 name = "wist-auth"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "http",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -2724,11 +2725,12 @@ dependencies = [
 
 [[package]]
 name = "wist-auth"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7ea4d46a772e4f68fabc7478ad49e0eb1b95219ba829486632c75305bb7042a"
+checksum = "69420ddd0ef2d69c7f96b9fb469fbc9bcca0176c02e102dd87d391a139f3406f"
 dependencies = [
  "http",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -2736,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "wist-cred"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2748,22 +2750,23 @@ dependencies = [
  "orion-variate",
  "rcgen",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "toml",
  "tower",
- "wist-auth 0.2.0",
+ "wist-auth 0.3.0",
  "wist-cred-peer",
  "wist-pki",
 ]
 
 [[package]]
 name = "wist-cred-peer"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89fa42320b7f632a70ef7a39d3503b343d4832f0f8adc8d2640607c514570a49"
+checksum = "f6828e916c249702c9c1729b96c81cb62e41e941c8aac5ec1675764a8b7cfd01"
 dependencies = [
  "anyhow",
  "axum",
@@ -2775,7 +2778,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
- "wist-auth 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wist-auth 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "wist-pki",
 ]
 

@@ -120,6 +120,17 @@ umask "$prev_umask"
 chmod 0644 "$INSTALL_DIR/client-ca.pem"
 say "client-ca.pem ✓"
 
+# ── 签发方的授权签名公钥（公开材料）──────────────────────────────────────────
+# 验证方用它验每条授权记录的签名。没有它就只能“盲信”推过来的内容。
+ISSUER_PUB_HEX='__ISSUER_SIGNING_PUB__'
+if [[ -n "$ISSUER_PUB_HEX" ]]; then
+  printf '%s\n' "$ISSUER_PUB_HEX" >"$INSTALL_DIR/issuer-signing.pub"
+  chmod 0644 "$INSTALL_DIR/issuer-signing.pub"
+  say "issuer-signing.pub ✓"
+else
+  say "未配置签发方签名公钥（下游开了 require_signature 时会拒收）"
+fi
+
 # ── 密钥对：本机生成，**已存在就不动**（换钥会打断已经生效的 mTLS）────────
 step "准备本机密钥对"
 KEY="$INSTALL_DIR/server.key"
@@ -222,6 +233,9 @@ audience = "$AUDIENCE"
 allowed_issuers = ["wist-cred"]
 # 授权哪些能力由你自己定（cred 只证明「来的是 cred」，不替你决定给什么权）：
 # known_roles = ["investigation:run"]
+# 要求每条授权记录带签发方签名（公钥就是上面落下的 issuer-signing.pub）：
+# require_signature = true
+# issuer_public_key = "$INSTALL_DIR/issuer-signing.pub"
 
 [ctrl.tls]
 cert_file      = "$INSTALL_DIR/server.crt"

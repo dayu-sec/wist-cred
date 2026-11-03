@@ -65,6 +65,9 @@ async fn main() -> anyhow::Result<()> {
             max_ttl_seconds: 2_592_000,
             break_glass_max_ttl_seconds: 7_776_000,
             overlap_seconds: 300,
+            // 本示例模拟“手工分发”（不走 push），所以不需要签发钥；
+            // 真实推送会在这里配 Ed25519 私钥，X 侧开 require_signature 验签。
+            signing_key: None,
         },
         push: None,
         onboarding: OnboardingConfig {
@@ -186,6 +189,8 @@ fn build_verifier(path: &std::path::Path) -> anyhow::Result<CredentialStore> {
         max_ttl_by_role: caps,
         visible_resources: None,
         clock_skew_seconds: 60,
+        require_signature: false,
+        issuer_public_keys: Vec::new(),
     });
     for entry in file.credentials {
         store.register(entry)?;
