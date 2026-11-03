@@ -455,7 +455,7 @@ async fn fetch_script(
 
     let enroll_url = format!(
         "{}/enroll/{token}/certificate",
-        public_base(&headers).unwrap_or_default()
+        public_base(&state.config.server, &headers).unwrap_or_default()
     );
     let issuer_public = state
         .config
@@ -742,7 +742,11 @@ async fn enroll_peer(
 ///
 /// 取不到或格式不对时返回 `None`，脚本自己会用 `--endpoint` 补。
 /// **不对它做任何信任假设**：它只决定「往哪里回连」，而回连的目标由执行命令的人确认。
-fn public_base(headers: &HeaderMap) -> Option<String> {
+fn public_base(server: &crate::config::ServerConfig, headers: &HeaderMap) -> Option<String> {
+    // 配了就以配置为准：反代默认的 `$host` 不带端口，靠请求头会把 `:4444` 弄丢。
+    if let Some(base) = &server.public_base_url {
+        return Some(base.clone());
+    }
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -1498,6 +1502,7 @@ mod tests {
                 ingress_header: OPERATOR_HEADER.to_string(),
                 admin_password_hash: String::new(),
                 trusted_peers: vec!["127.0.0.1/32".to_string()],
+                public_base_url: None,
             })
         }
 
@@ -1509,6 +1514,19 @@ mod tests {
                 ingress_header: OPERATOR_HEADER.to_string(),
                 admin_password_hash: wist_auth::sha256_hex(password),
                 trusted_peers: Vec::new(),
+                public_base_url: None,
+            })
+        }
+
+        /// 现场形态：外面还有一层反代，对外基址只能由配置给（`$host` 不带端口）。
+        fn with_public_base(base: &str) -> Self {
+            Self::with_server(ServerConfig {
+                listen_addr: "127.0.0.1:8443".to_string(),
+                mode: AuthMode::Ingress,
+                ingress_header: OPERATOR_HEADER.to_string(),
+                admin_password_hash: String::new(),
+                trusted_peers: vec!["127.0.0.1/32".to_string()],
+                public_base_url: Some(base.to_string()),
             })
         }
 
@@ -2407,6 +2425,37 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "credential_not_found");
+    }
+
+    #[tokio::test]
+    async fn enroll_url_comes_from_the_configured_public_base() {
+        // 反代的 `$host` 不带端口：靠请求头推会把 `:4444` 弄丢，登记会打到别的端口上（现场踩过）。
+        let harness = Harness::with_public_base("https://cred.example.com:4444")
+            .with_peer("wist-center", "center.internal")
+            .with_signer();
+
+        let (status, minted) = harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-center/enrollment-tickets",
+                Some("alice"),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let path = minted["path"].as_str().expect("path");
+
+        let (status, script) = harness.call_text("GET", path, None, "127.0.0.1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            script.contains("ENROLL_URL='https://cred.example.com:4444/enroll/"),
+            "配置的基址必须原样带上端口，got: {script}"
+        );
+        assert!(
+            script.contains("/certificate'"),
+            "登记地址应指向 certificate，got: {script}"
+        );
     }
 
     #[tokio::test]

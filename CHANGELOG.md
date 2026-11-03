@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.2-alpha] - 2026-11-03
+
+### 修复：接入脚本里的登记地址丢端口
+
+- 现象：在 `https://cred…:4444` 下跑接入命令，取脚本、生成密钥都成功，最后一步登记拿到 **404**。
+- 原因：脚本里的 `ENROLL_URL` 是 cred 按请求头拼的绝对地址，而入口 nginx 用的是
+  `proxy_set_header Host $host` —— **`$host` 不带端口**，于是拼成 `https://cred…/enroll/<券>/certificate`，
+  机器把 CSR 打到了 443 上（那里不是 cred，所以是空体 404，而不是券过期的 410）。
+- 新增 `[server].public_base_url`（如 `https://cred.example.com:4444`）：配了就原样用它，
+  不配才回落到请求头。与网关的 `[server] public_base_url` 同一个口径。
+- 加载期校验：必须是绝对 `http(s)` URL；末尾 `/` 会去掉（否则拼出 `//enroll/…`）。
+- 部署侧配合：`wist-cred-stack` 把 nginx 的 `/enroll/` 改成转发 `$http_host`（兜底），
+  并在 localize 时用 `WEB_DOMAIN` + `WEB_HOST_PORT` 渲染 `public_base_url`。
+
 ## [0.4.1-alpha] - 2026-11-03
 
 ### 修复：接入脚本不再要求 root

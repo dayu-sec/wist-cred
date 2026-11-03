@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
             ingress_header: OPERATOR_HEADER.to_string(),
             admin_password_hash: String::new(),
             trusted_peers: vec!["127.0.0.1/32".to_string()],
+            public_base_url: None,
         },
         storage: StorageConfig {
             path: cred_store_path.clone(),

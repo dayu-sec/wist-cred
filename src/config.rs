@@ -50,6 +50,12 @@ pub struct ServerConfig {
     /// 允许到达人机面的对端（unix socket 路径 / CIDR / 回环）。
     /// `ingress` 必填；`token` 可选（可用的第二道锁）。
     pub trusted_peers: Vec<String>,
+    /// 对外基址（如 `https://cred.example.com:4444`，不带末尾 `/`）。
+    ///
+    /// 接入脚本里的“交 CSR”地址是**绝对地址**：机器拿到脚本时并不知道自己是从哪个入口取的，
+    /// 只能由服务端拼。不配 = 用请求头推（`Host` + `X-Forwarded-Proto`）。
+    /// **走反代时建议配**：nginx 默认的 `$host` 不带端口，会把 `:4444` 丢掉。
+    pub public_base_url: Option<String>,
 }
 
 /// `token`：页面输口令，服务自己验（发布态）；
@@ -328,6 +334,9 @@ struct RawServer {
     admin_password: Option<String>,
     #[serde(default)]
     trusted_peers: Vec<String>,
+    /// 对外基址（`https://host[:port]`）。不配 = 用请求头推。
+    #[serde(default)]
+    public_base_url: Option<String>,
 }
 
 impl Default for RawServer {
@@ -338,6 +347,7 @@ impl Default for RawServer {
             ingress_header: default_ingress_header(),
             admin_password: None,
             trusted_peers: Vec::new(),
+            public_base_url: None,
         }
     }
 }
@@ -621,6 +631,19 @@ impl RawConfig {
         if store_path.trim().is_empty() {
             bail!("onboarding.store_path must not be empty");
         }
+
+        // 对外基址：拼接入脚本里的绝对地址用。末尾 `/` 去掉，否则会拼出 `//enroll/...`；
+        // 必须是绝对 http(s) —— 相对值拼出来的脚本只能在那台机器上碰巧能用。
+        let public_base_url = match self.server.public_base_url.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim().trim_end_matches('/');
+                if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                    bail!("server.public_base_url must be an absolute http(s) URL");
+                }
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
         let onboarding_dir = match &self.onboarding.dir {
             Some(path) => Some(path_of(path)?),
             None => None,
@@ -651,6 +674,7 @@ impl RawConfig {
                 ingress_header,
                 admin_password_hash,
                 trusted_peers: self.server.trusted_peers,
+                public_base_url,
             },
             storage: StorageConfig {
                 path: PathBuf::from(storage_path),
@@ -858,6 +882,26 @@ mod tests {
         let err = parse(text).expect_err("empty peers must be rejected");
         assert!(
             err.to_string().contains("trusted_peers"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn public_base_url_must_be_absolute_and_keeps_its_port() {
+        // 接入脚本里的“交 CSR”地址是服务端拼的绝对地址；相对值拼出来只会在
+        // 那台机器上碰巧能用。端口必须原样保留 —— 反代默认的 `$host` 就是把它弄丢的那个。
+        let ok = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\npublic_base_url = \"https://cred.example.com:4444/\"\n";
+        let config = parse(ok).expect("absolute URL is accepted");
+        assert_eq!(
+            config.server.public_base_url.as_deref(),
+            Some("https://cred.example.com:4444"),
+            "末尾的 `/` 要去掉，否则会拼出 `//enroll/...`"
+        );
+
+        let bad = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\npublic_base_url = \"cred.example.com:4444\"\n";
+        let err = parse(bad).expect_err("relative base must be rejected");
+        assert!(
+            err.to_string().contains("public_base_url"),
             "unexpected error: {err}"
         );
     }
