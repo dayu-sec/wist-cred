@@ -113,6 +113,20 @@ cargo run --example closed_loop
 ⑤ 再验证失败    code=token_revoked status=401
 ```
 
+## 示例验证方（`wist-cred-example`）
+
+`examples/peer_example.rs`：一个**真的**双向认证服务，就是「下游怎么接」的样板
+（依赖 crates.io 上的 `wist-cred-peer`，不引本地 path）。
+
+它**跟本服务一起发**，但走**独立镜像**（一个镜像一个二进制）：`wist-cred:vX.Y.Z-example`
+（同一个包名 + `-example` 后缀，ghcr / TCR 双推）——部署栈的 demo peer 就拉这个镜像，
+现场不需要 Rust、也不需要多一个包名。
+
+```sh
+cargo run --example peer_example -- --listen 127.0.0.1:19443 --dir ./certs \
+  --audience demo --issuer wist-cred --known-roles read,investigation:run --verify-endpoint
+```
+
 ## 开发
 
 构建 / 检查 / 测试统一走 `gx`（不要直接 `cargo build`）：

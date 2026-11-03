@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0-alpha] - 2026-11-03
+
+### 新增：示例验证方（`wist-cred-example` 镜像）
+
+- `examples/peer_example.rs`：一个真的双向认证验证方（收 register/revoke、自己存摘要表、心跳、
+  联调时的 `POST /verify`），依赖 crates.io 上的 `wist-cred-peer` —— 下游接入的样板。
+- **自己的镜像**：`wist-cred:vX.Y.Z-example`（同一个包名 + `-example` 后缀，ghcr / TCR 双推）。
+  生态惯例是一个镜像一个二进制，所以**不**把它塞进服务镜像；名字用 tag 后缀而不是另开包，
+  是因为 GHCR 只允许推本仓同名包。
+- release tarball 里也带 `wist-cred-example` 二进制（不想用容器时直接跑）。
+
 ## [0.2.0-alpha] - 2026-11-03
 
 ### 新增：人机面的验证改由本服务自己做（`mode = "token"`）

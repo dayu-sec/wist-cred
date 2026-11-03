@@ -44,15 +44,20 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cargo build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          # 示例验证方：跟同一版发，现场不用装 Rust；镜像里它是第二个二进制。
+          cargo build --release --target ${{ matrix.target }} --example peer_example
 
       - name: Package tarball
         run: |
           mkdir -p artifacts
           cp "target/${{ matrix.target }}/release/wist-cred" artifacts/wist-cred
+          cp "target/${{ matrix.target }}/release/examples/peer_example" artifacts/wist-cred-example
           # 配置样例随包走：没有它，拿到二进制的人不知道该写哪些段。
           cp config.example.toml artifacts/config.example.toml
-          tar -czf "wist-cred-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-cred config.example.toml
+          tar -czf "wist-cred-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts \
+            wist-cred wist-cred-example config.example.toml
 
       # 注意：action 的 path 相对 `github.workspace` 解析，不跟 working-directory。
       - uses: actions/upload-artifact@v7
@@ -113,15 +118,22 @@ jobs:
           ghcr="ghcr.io/${{ github.repository }}"
           tcr="dy-sec.tencentcloudcr.com/cloud/wist-cred"
           tags="$(printf '%s\n%s' "$ghcr:${{ github.ref_name }}" "$tcr:${{ github.ref_name }}")"
+          # 示例验证方：同包名 + `-example` 后缀（GHCR 只允许推本仓同名包，另起包名会被拒）。
+          example_tags="$(printf '%s\n%s' \
+            "$ghcr:${{ github.ref_name }}-example" \
+            "$tcr:${{ github.ref_name }}-example")"
           case "${{ github.ref_name }}" in
             *-*)
               ;;
             *)
               tags="$(printf '%s\n%s' "$tags" "$ghcr:latest")"
               tags="$(printf '%s\n%s' "$tags" "$tcr:latest")"
+              example_tags="$(printf '%s\n%s' "$example_tags" "$ghcr:latest-example")"
+              example_tags="$(printf '%s\n%s' "$example_tags" "$tcr:latest-example")"
               ;;
           esac
           printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
+          printf 'example_tags<<__EOF__\n%s\n__EOF__\n' "$example_tags" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -129,6 +141,16 @@ jobs:
           context: docker
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64,linux/arm64
+
+      # 示例验证方：同一个仓、同一套二进制产物，只是另一个镜像（一个镜像一个二进制）。
+      - name: Build and push (example)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/Dockerfile.example
+          push: true
+          tags: ${{ steps.meta.outputs.example_tags }}
           platforms: linux/amd64,linux/arm64
 
   # 3. 发布 tarball 到 GitHub Release

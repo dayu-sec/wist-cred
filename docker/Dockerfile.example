@@ -1,0 +1,38 @@
+# ===========================================================================
+# wist-cred-example — 示例验证方（X）的运行镜像（Multi-arch）
+#
+# 与 `docker/Dockerfile`（服务本体）同一套做法：**预编译二进制 + 最小运行时**，
+# 二进制由 release 流水线按架构编译、放在 build context 的 amd64/ arm64/ 下。
+#
+# 为什么单独一个镜像（而不是塞进服务镜像里）：生态惯例是**一个镜像一个二进制**；
+# 服务镜像里不该带一个只有演示才用的程序。
+#
+# 镜像名沿用 `wist-cred` 这个包、加 `-example` 后缀（如 `wist-cred:v0.3.0-alpha-example`）：
+# GHCR 只允许推本仓同名包，另起一个 `wist-cred-example` 包会被拒；打成 tag 则双源都成立。
+# ===========================================================================
+
+FROM ubuntu:24.04
+
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.source="https://github.com/dayu-sec/wist-cred"
+LABEL org.opencontainers.image.description="Demo verifier for wist-cred (usage sample; not the service)"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+# 与 wist-cred 一致：只需根证书（TLS 走 rustls），uid 999、`/data` 可写。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 999 -s /bin/false wist \
+    && mkdir -p /data && chown wist:wist /data
+
+COPY ${TARGETARCH}/wist-cred-example /usr/local/bin/wist-cred-example
+
+USER wist
+WORKDIR /data
+
+# 收 cred 的推送；不对宿主发布端口。
+EXPOSE 19443
+
+ENTRYPOINT ["wist-cred-example"]
+CMD []

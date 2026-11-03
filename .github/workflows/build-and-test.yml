@@ -52,7 +52,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Cargo build (release)
-        run: cargo build --release --all
+        run: cargo build --release --all --examples
 
       - name: Cargo test (release)
         run: cargo test --release --all

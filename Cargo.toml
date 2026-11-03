@@ -1,6 +1,6 @@
 [package]
 name = "wist-cred"
-version = "0.2.0" #@gxl:set(version)
+version = "0.3.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["wist Dev Team"]
@@ -44,3 +44,11 @@ tower = { version = "0.5", features = ["util"] }
 # 验证侧的真实实作（闭环测试要拿它验，不是一个 mock）。
 # 同一个 path：features 相加不冲突（runtime 不带 credential，测试才带）。
 wist-auth = { path = "../wist-auth", default-features = false, features = ["credential"] }
+# 示例验证方依赖**已发布**的 `wist-cred-peer`（不引本地 path）：它就是“下游怎么接”的样板。
+# 它只用于 example / 镜像 `wist-cred-example`，不进服务二进制。
+wist-cred-peer = "0.1"
+
+# 示例验证方（X）：一个真能跑的双向认证服务，release 会把它打成 `wist-cred-example` 镜像。
+[[example]]
+name = "peer_example"
+path = "examples/peer_example.rs"

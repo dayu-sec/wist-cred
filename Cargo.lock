@@ -1763,6 +1763,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2722,8 +2723,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wist-auth"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7ea4d46a772e4f68fabc7478ad49e0eb1b95219ba829486632c75305bb7042a"
+dependencies = [
+ "http",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "wist-cred"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2741,7 +2754,28 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
- "wist-auth",
+ "wist-auth 0.2.0",
+ "wist-cred-peer",
+ "wist-pki",
+]
+
+[[package]]
+name = "wist-cred-peer"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89fa42320b7f632a70ef7a39d3503b343d4832f0f8adc8d2640607c514570a49"
+dependencies = [
+ "anyhow",
+ "axum",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "wist-auth 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "wist-pki",
 ]
 
