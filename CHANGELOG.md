@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.4.7-alpha] - 2026-11-03
+
+### 修复：cred.toml 的三个真问题（review 第一/二遍）
+
+1. **没下发签名公钥也会写 `require_signature = true`** —— 验证方会拿一个不存在的
+   `issuer-signing.pub` 去验签，然后拒绝一切授权记录（比“不验”更难查）。
+   现在只有真下发了公钥才写这两行；否则留成注释并说明原因。
+2. **`cred.toml` 被挪出材料目录时相对路径会指到虚处**。
+   现在强制同目录（`--dir` 换整个目录），并在错误信息里说清楚。
+3. **`--config` 指到目录 / 父目录不存在**时 `mv` 会静默做怪事（把文件搬进目录）。
+   现在先判目录 + `mkdir -p`。
+
+### 变更：cred.toml 正文改由服务端渲染
+
+以前正文在 bash 里用 heredoc 拼（条件分支没法测，写错一处整份不可用）。
+现在 `render_script` 里的 `cred_toml()` 生成正文，脚本只负责 `cat > … <<'EOF'` 原样落盘。
+
+- 字段名 `issuer_public_key` → **`issuer_public_key_file`**（它是路径，不是公钥本身）。
+- 角色为空时**不写** `roles = []`（空数组在有些消费方 = 一个角色都不发），留成注释。
+- 正文里补一句“相对路径按本文件所在目录解”。
+- 删掉死变量 `AUDIENCE`（`shellcheck SC2034`）。
+
+### 测试
+
+- `script_writes_a_uniform_cred_toml`：正文在、没有 `[ctrl.*]`、同目录约束在。
+- `cred_toml_only_requires_signature_when_the_key_is_shipped`：有/无公钥两种分支。
+- `cred_toml_carries_reported_roles_when_any`：有角色写数组、没角色不写空数组。
+- 共 118 passed；模板过 `shellcheck -S warning`。
+
 ## [0.4.6-alpha] - 2026-11-03
 
 ### 变更：接入不再改目标程序的配置，改产出一份统一的 `cred.toml`

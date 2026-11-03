@@ -46,7 +46,7 @@ usage() {
 用法: bash -s -- [选项]
 
   --dir <dir>       材料与 cred.toml 的落点（默认：root → /etc/wist/<peer>；普通用户 → ./wist-cred/<peer>）
-  --config <file>   只改 cred.toml 的位置（默认 <dir>/cred.toml）
+  --config <file>   只改 cred.toml 的文件名/位置（必须与材料同目录；换目录用 --dir）
   --restart <cmd>   落盘后执行的重启命令（例如 'gops run stop && gops run start'）
   --cacert <pem>    校验签发方 TLS 的 CA（默认 -k，见下）
   --endpoint <url>  覆盖内嵌的登记地址（入口换了地址时用）
@@ -114,7 +114,6 @@ say "openssl ✓   curl ✓   材料目录 ${INSTALL_DIR} ✓"
 # ── 确定身份：主机名（证书 SAN）与收数地址 ────────────────────────
 step "确定本机身份"
 # 受众就是系统名，不另外问。
-AUDIENCE="$PEER_NAME"
 if [[ -z "$PEER_HOST" && -n "$PEER_ENDPOINT" ]]; then
   PEER_HOST="$(printf '%s' "$PEER_ENDPOINT" | sed -e 's#^https://##' -e 's#[/:].*##')"
 fi
@@ -248,33 +247,22 @@ chmod 0644 "$INSTALL_DIR/server.crt"
 say "server.crt ✓"
 
 # ── 统一接入文件 cred.toml（本脚本维护，程序只读）──────────────────────────
-# 为什么不往“每个程序自己的配置”里写：center / ingest / console 的 schema 各不相同，
-# 脚本既不知道、也不该知道。这一份只写**与程序无关的两件事**：
-#   我是谁（[identity]）、我认什么（[verify]）。
-# 相对路径按**本文件所在目录**解 —— 把整个目录一起挂进容器即可。
+# 正文由签发方渲染后内嵌（内容取决于“有没有下发签名公钥 / 本机上报了什么角色”），
+# 这里只负责落盘：不在运行时拼 TOML，错一处就整份不可用。
 CRED_FILE="${CONFIG_FILE:-$INSTALL_DIR/cred.toml}"
-tmp_cred="$(mktemp)"
-trap 'rm -f "$tmp_body" "$tmp_cred"' EXIT
+[[ -d "$CRED_FILE" ]] && die "--config 指向的是一个目录：${CRED_FILE}（要的是文件路径）"
+mkdir -p "$(dirname "$CRED_FILE")" 2>/dev/null \
+  || die "建不了 cred.toml 的目录：$(dirname "$CRED_FILE")"
+# `[identity]` 里是**相对文件名**，按 cred.toml 所在目录解 —— 所以它必须与材料同目录，
+# 否则那几个名字会指到虚处。换目录请用 --dir。
+if [[ "$(cd "$(dirname "$CRED_FILE")" && pwd)" != "$(cd "$INSTALL_DIR" && pwd)" ]]; then
+  die "cred.toml 必须与材料同目录（现在在 ${CRED_FILE}）；要换目录请用 --dir <目录>"
+fi
 
-cat >"$tmp_cred" <<EOF
-# >>> wist-cred · $PEER_NAME · 本文件由接入脚本维护，重跑会整份重写 >>>
-# 消费方式：程序启动时加一行 —— --credentials <本文件路径>（挂进容器后就是容器内路径）。
-[identity]
-cert      = "server.crt"
-key       = "server.key"
-client_ca = "client-ca.pem"
-
-[verify]
-audience          = "$AUDIENCE"
-allowed_issuers   = ["wist-cred"]
-require_signature = true
-issuer_public_key = "issuer-signing.pub"
-# 这个系统能验哪些角色由它自己定；不写 = 不发角色
-# roles = ["admin", "read"]
-# <<< wist-cred · $PEER_NAME <<<
-EOF
-chmod 0644 "$tmp_cred"
-mv -f "$tmp_cred" "$CRED_FILE"
+cat >"$CRED_FILE" <<'WIST_CRED_TOML'
+__CRED_TOML__
+WIST_CRED_TOML
+chmod 0644 "$CRED_FILE"
 say "cred.toml ✓（$CRED_FILE）"
 
 step "接入文件（与程序无关，程序只需指过来）"
