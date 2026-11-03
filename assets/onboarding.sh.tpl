@@ -12,10 +12,9 @@
 # ⚠ 这条命令里带着一张**一次性券**：跑过一次就作废，别转发、别贴进 ticket。
 #
 # 用法：
-#   curl -fsSLk '<url>' | bash                                   # 只落材料 + 打印片段
-#   curl -fsSLk '<url>' | bash -s -- --config /etc/x/ctrl.toml    # 顺带写进配置
-#   curl -fsSLk '<url>' | bash -s -- --config /etc/x/ctrl.toml \
-#                                   --restart 'systemctl restart x-ctrl'
+#   curl -fsSLk '<url>' | bash                                   # 落材料 + 生成 cred.toml
+#   curl -fsSLk '<url>' | bash -s -- --dir ./configs/wist-cred    # 指定落点目录
+#   curl -fsSLk '<url>' | bash -s -- --restart 'gops run stop && gops run start'
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -46,9 +45,9 @@ usage() {
   cat <<'USAGE'
 用法: bash -s -- [选项]
 
-  --dir <dir>       材料安装目录（默认：root → /etc/wist/<peer>；普通用户 → ./wist-cred/<peer>）
-  --config <file>   把配置片段追加进这个 TOML（默认只打印，不改任何文件）
-  --restart <cmd>   落盘后执行的重启命令（例如 'systemctl restart wist-ingest-ctrl'）
+  --dir <dir>       材料与 cred.toml 的落点（默认：root → /etc/wist/<peer>；普通用户 → ./wist-cred/<peer>）
+  --config <file>   只改 cred.toml 的位置（默认 <dir>/cred.toml）
+  --restart <cmd>   落盘后执行的重启命令（例如 'gops run stop && gops run start'）
   --cacert <pem>    校验签发方 TLS 的 CA（默认 -k，见下）
   --endpoint <url>  覆盖内嵌的登记地址（入口换了地址时用）
   --host <fqdn>     证书 SAN（默认从 --advertise 推导，否则用本机 hostname -f）
@@ -58,9 +57,10 @@ usage() {
   -h, --help        显示本帮助
 
 不要求 root，只要求材料目录可写：容器栈部署就 cd 到栈根直接跑（材料落 ./wist-cred/<peer>），
-或用 --dir 指到栈里的目录（例如 --dir ./identity/<peer>）；systemd 式部署用 root 跑即落 /etc/wist/<peer>。
-不带 --config 时本脚本只落材料并打印片段。
-重复运行是安全的：已有私钥不覆盖，同一段配置会被原位替换。
+或用 --dir 指到栈里的目录（例如 --dir ./configs/wist-cred / --dir ./identity/cred-client）。
+**总是会生成 cred.toml**（与程序无关：只写 [identity] 与 [verify]），程序启动时
+加一行 `--credentials <cred.toml>` 指过来就行 —— 不需要改程序自己的配置。
+重复运行是安全的：已有私钥不覆盖，cred.toml 整份重写。
 
 关于 -k：入口的 TLS 证书通常是自签的（平台部署惯例，center 的安装脚本同样用
 curl -fsSLk）。所以这里不靠 TLS 校验收据的真伪，而是两条硬校验：
@@ -247,72 +247,51 @@ mv -f "$tmp_body" "$INSTALL_DIR/server.crt"
 chmod 0644 "$INSTALL_DIR/server.crt"
 say "server.crt ✓"
 
-# ── 配置片段 ────────────────────────────────────────────────────────────────
-snippet="$(mktemp)"
-trap 'rm -f "$tmp_body" "$snippet"' EXIT
+# ── 统一接入文件 cred.toml（本脚本维护，程序只读）──────────────────────────
+# 为什么不往“每个程序自己的配置”里写：center / ingest / console 的 schema 各不相同，
+# 脚本既不知道、也不该知道。这一份只写**与程序无关的两件事**：
+#   我是谁（[identity]）、我认什么（[verify]）。
+# 相对路径按**本文件所在目录**解 —— 把整个目录一起挂进容器即可。
+CRED_FILE="${CONFIG_FILE:-$INSTALL_DIR/cred.toml}"
+tmp_cred="$(mktemp)"
+trap 'rm -f "$tmp_body" "$tmp_cred"' EXIT
 
-cat >"$snippet" <<EOF
-# >>> wist-cred mTLS · $PEER_NAME · 本段由接入脚本维护，重跑会原位替换 >>>
-[ctrl.credentials]
-enabled = true
-audience = "$AUDIENCE"
-allowed_issuers = ["wist-cred"]
-# 授权哪些能力由你自己定（cred 只证明「来的是 cred」，不替你决定给什么权）：
-# known_roles = ["investigation:run"]
-# 要求每条授权记录带签发方签名（公钥就是上面落下的 issuer-signing.pub）：
-# require_signature = true
-# issuer_public_key = "$INSTALL_DIR/issuer-signing.pub"
+cat >"$tmp_cred" <<EOF
+# >>> wist-cred · $PEER_NAME · 本文件由接入脚本维护，重跑会整份重写 >>>
+# 消费方式：程序启动时加一行 —— --credentials <本文件路径>（挂进容器后就是容器内路径）。
+[identity]
+cert      = "server.crt"
+key       = "server.key"
+client_ca = "client-ca.pem"
 
-[ctrl.tls]
-cert_file      = "$INSTALL_DIR/server.crt"
-key_file       = "$INSTALL_DIR/server.key"
-client_ca_file = "$INSTALL_DIR/client-ca.pem"
-# <<< wist-cred mTLS · $PEER_NAME <<<
+[verify]
+audience          = "$AUDIENCE"
+allowed_issuers   = ["wist-cred"]
+require_signature = true
+issuer_public_key = "issuer-signing.pub"
+# 这个系统能验哪些角色由它自己定；不写 = 不发角色
+# roles = ["admin", "read"]
+# <<< wist-cred · $PEER_NAME <<<
 EOF
+chmod 0644 "$tmp_cred"
+mv -f "$tmp_cred" "$CRED_FILE"
+say "cred.toml ✓（$CRED_FILE）"
 
-if [[ -z "$CONFIG_FILE" ]]; then
-  step "配置片段（追加到你的服务配置里，改完重启）"
-  echo
-  cat "$snippet"
-  echo
-  say "怎么让它自动写（不用重新开券）：到 cred 页面「认证系统 → 接入命令」把"
-  say "「配置文件 / 重启命令」填上，点「保存并更新命令」，再跑那一条新的。"
-  say "之后每次生成的脚本都自带这两个值，命令永远就一行、不带参数。"
-  say ""
-  say "若确实要在命令行手动补（管道给 bash 必须带 -s --，否则 bash 会把"
-  say "--config 当成自己的参数，报 'invalid option'）："
-  say "  curl -fsSLk '<新命令的 URL>' | bash -s -- --config <配置文件> [--restart '<命令>']"
-  say "注意：一次性券在登记时已经用掉，旧 URL 重跑只会 401/410。"
-  exit 0
-fi
+step "接入文件（与程序无关，程序只需指过来）"
+cat "$CRED_FILE"
 
-# ── 写进配置文件（可重复：先删旧段再追加）───────────────────────────────────
-step "写入 $CONFIG_FILE"
-[[ -f "$CONFIG_FILE" ]] || die "配置文件不存在：$CONFIG_FILE"
-backup="$CONFIG_FILE.wist-cred.bak"
-[[ -f "$backup" ]] || cp "$CONFIG_FILE" "$backup"
-say "首次写入，原文件已备份为 $backup"
+step "下一步"
+say "1) 把这个目录挂进容器（只读）：$INSTALL_DIR"
+say "2) 程序启动命令加一行：--credentials <容器里的 cred.toml 路径>"
+say "3) 重启用：gops run stop && gops run start（systemd 部署用 systemctl restart <服务>）"
 
-stripped="$(mktemp)"
-trap 'rm -f "$tmp_body" "$snippet" "$stripped"' EXIT
-awk '
-  index($0, "# >>> wist-cred mTLS") == 1 { skip = 1; next }
-  index($0, "# <<< wist-cred mTLS") == 1 { skip = 0; next }
-  !skip { print }
-' "$CONFIG_FILE" >"$stripped"
-{ cat "$stripped"; echo; cat "$snippet"; } >"$CONFIG_FILE"
-say "已写入（旧的 wist-cred 段已替换）"
-
-# ── 重启 ────────────────────────────────────────────────────────────────────
 if [[ -n "$RESTART_CMD" ]]; then
   step "重启服务"
   sh -c "$RESTART_CMD"
   say "已执行：$RESTART_CMD"
-else
-  say "记得重启你的服务让配置生效（或用 --restart 交给本脚本）"
 fi
 
 step "完成"
-say "cred 来调你 → 出示 CA-I 签发的客户端证书（CN=wist-cred），你用 client_ca_file 验它"
+say "cred 来调你 → 出示 CA-I 签发的客户端证书（CN=wist-cred），你用 client-ca.pem 验它"
 say "你的服务器证书由签发方按本机 CSR 签出（CN/SAN=${PEER_HOST}），私钥从未离开本机"
 say "材料目录：${INSTALL_DIR}"

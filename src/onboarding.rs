@@ -359,6 +359,39 @@ mod tests {
     }
 
     #[test]
+    fn script_writes_a_uniform_cred_toml() {
+        // 不往“每个程序自己的配置”里写：只产出一份与程序无关的 cred.toml。
+        let peer = Peer {
+            name: "wist-center".to_string(),
+            host: Some("center.internal".to_string()),
+            endpoint: None,
+            healthz: None,
+            roles: Vec::new(),
+            created_at: 0,
+            created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
+        };
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
+
+        assert!(
+            script.contains(r#"CRED_FILE="${CONFIG_FILE:-$INSTALL_DIR/cred.toml}""#),
+            "默认落在材料目录的 cred.toml"
+        );
+        assert!(script.contains("[identity]") && script.contains("[verify]"));
+        assert!(
+            script.contains(r#"issuer_public_key = "issuer-signing.pub""#),
+            "相对路径：按 cred.toml 所在目录解，整个目录一起挂"
+        );
+        assert!(
+            !script.contains("[ctrl."),
+            "不得再往目标程序自己的配置里写（schema 各不相同）"
+        );
+    }
+
+    #[test]
     fn setup_target_is_embedded_into_the_script() {
         // 「自带 --config」的实现点：落点存在认证系统上，签发时烘进脚本，
         // 所以命令永远就一行，不用为了补参数再开一张券。

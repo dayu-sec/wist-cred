@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.4.6-alpha] - 2026-11-03
+
+### 变更：接入不再改目标程序的配置，改产出一份统一的 `cred.toml`
+
+以前脚本会把 `[ctrl.credentials]` / `[ctrl.tls]` 片段写进“目标程序自己的配置”。
+问题是：**每个程序的 schema 都不一样**（center 是 `[credentials]` 且 TLS 并进去，ingest/console 又各不相同），
+脚本既不知道、也不该知道；而栈部署的配置还是 localize 渲染的，写进去会被覆盖。
+
+现在只产出一份**与程序无关**的文件，落在材料目录里（默认 `<dir>/cred.toml`）：
+
+```toml
+[identity]
+cert      = "server.crt"      # 相对本文件所在目录
+key       = "server.key"
+client_ca = "client-ca.pem"
+
+[verify]
+audience          = "wist-center"
+allowed_issuers   = ["wist-cred"]
+require_signature = true
+issuer_public_key = "issuer-signing.pub"
+```
+
+- 程序启动时加一行 `--credentials <cred.toml>` 指过来即可（服务侧支持随后接入）。
+- 相对路径按**文件所在目录**解 ⇒ 把整个材料目录一起挂进容器就行，不用关心宿主机路径。
+- 不再修改、不再备份目标程序自己的配置文件；`--config` 现在只是“把 cred.toml 放到别处”。
+- 脚本末尾直接打印下一步：挂目录 → 加 `--credentials` → `gops run stop && gops run start`。
+
 ## [0.4.5-alpha] - 2026-11-03
 
 ### 修复：参数缺值时的报错不再只给一句“需要一个值”
