@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0-alpha] - 2026-11-03
 
 ### 新增：人机面的验证改由本服务自己做（`mode = "token"`）
 
@@ -26,6 +26,11 @@
 - `admin_password` 写在非 `token` 模式下 → **拒启**（写了但不生效比写错键更危险）。
 - 口令两端带空白 → **拒启**（两端都会 trim，否则永远对不上）。
 - 错口令的 warn 日志带上对端地址（不记口令）。
+
+### 升级注意
+
+- 页面必须跟 `wist-cred-web` ≥ 0.2.0：旧页面不会带 `Authorization`，只会看到 401。
+- 弹部署栈请先写好 `cred_web_password`（栈的 `wist-cred-stack` ≥ 0.2.0 已跟进配置）。
 
 ## [0.1.1-alpha] - 2026-11-03
 
