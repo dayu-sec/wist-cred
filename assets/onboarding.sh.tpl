@@ -67,6 +67,11 @@ curl -fsSLk）。所以这里不靠 TLS 校验收据的真伪，而是两条硬�
   1. 返回的证书公钥必须与**本机私钥**匹配；
   2. 证书里必须有 DNS:<peer_host> 的 SAN。
 中间人既换不了证书（私钥不在他手上），也换不了名字。
+
+通过管道执行时**必须带 `-s --`**：
+  curl -fsSLk '<url>' | bash -s -- --config /etc/x/app.toml
+不加 `-s --` 的话，`--config` 会被 bash 自己吃掉（报 invalid option）——
+因为管道时 bash 读的是 stdin，参数只能走 `-s` 后的 `--`。
 USAGE
 }
 
@@ -270,8 +275,14 @@ if [[ -z "$CONFIG_FILE" ]]; then
   echo
   cat "$snippet"
   echo
-  say "自动写入：重跑本脚本并加 --config <配置文件> —— 但一次性券已经用掉了，"
-  say "所以请让管理员重新生成一条命令，再带 --config 跑。"
+  say "怎么让它自动写（不用重新开券）：到 cred 页面「认证系统 → 接入命令」把"
+  say "「配置文件 / 重启命令」填上，点「保存并更新命令」，再跑那一条新的。"
+  say "之后每次生成的脚本都自带这两个值，命令永远就一行、不带参数。"
+  say ""
+  say "若确实要在命令行手动补（管道给 bash 必须带 -s --，否则 bash 会把"
+  say "--config 当成自己的参数，报 'invalid option'）："
+  say "  curl -fsSLk '<新命令的 URL>' | bash -s -- --config <配置文件> [--restart '<命令>']"
+  say "注意：一次性券在登记时已经用掉，旧 URL 重跑只会 401/410。"
   exit 0
 fi
 

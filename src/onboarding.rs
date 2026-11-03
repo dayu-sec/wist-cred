@@ -331,6 +331,34 @@ mod tests {
     }
 
     #[test]
+    fn the_manual_hint_teaches_the_pipe_syntax() {
+        // 现场踩过：提示写“加 --config” → 人写成 `curl … | bash --config`，
+        // bash 把 --config 当成自己的参数，报 invalid option。管道时必须 `-s --`。
+        let peer = Peer {
+            name: "wist-center".to_string(),
+            host: Some("center.internal".to_string()),
+            endpoint: None,
+            healthz: None,
+            roles: Vec::new(),
+            created_at: 0,
+            created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
+        };
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
+        assert!(
+            script.contains("bash -s -- --config"),
+            "提示里必须给出带 `-s --` 的形式"
+        );
+        assert!(
+            !script.contains("重跑本脚本并加 --config"),
+            "旧提示会让人写成 `bash --config`"
+        );
+    }
+
+    #[test]
     fn setup_target_is_embedded_into_the_script() {
         // 「自带 --config」的实现点：落点存在认证系统上，签发时烘进脚本，
         // 所以命令永远就一行，不用为了补参数再开一张券。
