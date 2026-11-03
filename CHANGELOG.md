@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.4.1-alpha] - 2026-11-03
+
+### 修复：接入脚本不再要求 root
+
+- 以前不管 `--dir` 指到哪，脚本开头都 `[[ "$(id -u)" == "0" ]] || die`，在容器栈目录下
+  跑必须先 sudo（`wist-cred-stack/dev/svc.sh` 甚至为此伪造了一个 `id`）。
+- 改为**只看目录可不可写**（`mkdir -p` + `[[ -w ]]`）。默认目录按身份取：
+  root → `/etc/wist/<peer>`（systemd 部署的老行为不变），普通用户 → `./wist-cred/<peer>`。
+- `--dir` / `WIST_CRED_INSTALL_DIR` 仍然优先；错误提示直接给出三种出路。
+
+### 变更：接入面改成语义化的路径（破坏性，但券 ≤ 1h）
+
+| 旧 | 新 |
+|---|---|
+| `GET  /api/v1/onboarding/peers` | `GET  /api/v1/peers` |
+| `POST /api/v1/onboarding/peers` | `POST /api/v1/peers` |
+| `POST /api/v1/onboarding/peers/{name}/endpoint` | `POST /api/v1/peers/{name}/endpoint` |
+| `POST /api/v1/onboarding/peers/{name}/script` | `POST /api/v1/peers/{name}/enrollment-tickets` |
+| `GET  /onboarding/script/{token}` | `GET  /enroll/{token}/join.sh` |
+| `POST /onboarding/enroll/{token}` | `POST /enroll/{token}/certificate` |
+
+- 划法：`/api/v1/peers*` 是**人在管理面**对资源做的事；`/enroll/{token}/*` 是**机器拿着券**
+  兑换的具体产物。两套鉴权不同，路径上也分得开；`script` 是实现名、`onboarding` 是过程名，
+  两者都不该当资源名。
+- 机器面**不留别名**：券寿命 ≤ 1h 且一次即废，升级窗口内的在途链接最多失效一小时。
+- 管理面 `/api/v1/onboarding/peers*` 保留**一版别名**：cred 与 cred-web 是两个镜像，
+  灰度期页面可能还在调旧路径；下个版本删。
+- 入口反代的白名单路径同步从 `/onboarding/` 改为 `/enroll/`（`wist-cred-stack` 侧）。
+
+### 升级注意
+
+- `wist-cred-stack` ≥ 0.4.1（nginx 的白名单路径跟版）；`wist-cred-web` ≥ 0.2.1（调新路径）。
+- 已经生成、尚未使用的接入命令在升级后会 404，回页面重新生成一条即可。
+
 ## [0.4.0-alpha] - 2026-11-03
 
 ### 新增：授权记录签名（Ed25519）

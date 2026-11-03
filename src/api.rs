@@ -8,11 +8,12 @@
 //! | `GET  /api/v1/credentials` | 列出已发放凭据（**永不含摘要与明文**） |
 //! | `GET  /api/v1/credentials/{id}` | 单条 |
 //! | `POST /api/v1/credentials/{id}/revoke` | 撤销（幂等） |
-//! | `GET  /api/v1/onboarding/peers` | 列出认证系统 + **心跳状态** |
-//! | `POST /api/v1/onboarding/peers` | 新建认证系统（名称 / 主机名 / 收数地址） |
-//! | `POST /api/v1/onboarding/peers/{name}/script` | 签一张**一次性**接入券 |
-//! | `GET  /onboarding/script/{token}` | 取出接入脚本（只有公开材料 + 券） |
-//! | `POST /onboarding/enroll/{token}` | X 交 CSR 换自己的服务器证书（**兑现券**） |
+//! | `GET  /api/v1/policy` | 签发上限（页面拿它标出超限选项） |
+//! | `GET  /api/v1/peers` | 列出认证系统 + **心跳状态** |
+//! | `POST /api/v1/peers` | 新建认证系统（名称 / 主机名 / 收数地址） |
+//! | `POST /api/v1/peers/{name}/enrollment-tickets` | 签一张**一次性**接入券 |
+//! | `GET  /enroll/{token}/join.sh` | 取出接入脚本（只有公开材料 + 券） |
+//! | `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**） |
 //! | `GET  /healthz` / `GET /version` | 探针 |
 //!
 //! 人身份由**本服务自己验**（`server.mode`）：
@@ -22,7 +23,10 @@
 //!
 //! 两种模式下都可以再用 `trusted_peers` 收窄对端（空 = 不限）。
 //! **两条不走人机认证**：取脚本、交 CSR。取它们的是 X（机器），它没有操作者；
-//! 授权依据是 URL 里那张一次性券，且在兑现（`enroll`）时作废。
+//! 授权依据是 URL 里那张一次性券，且在兑现（`certificate`）时作废。
+//!
+//! 名字的划法：`/api/v1/peers*` 是**人在管理面**对资源做的事；`/enroll/{token}/*` 是
+//! **机器拿着券**兑换的具体产物（`join.sh` / `certificate`）。两套鉴权不同，路径上也分得开。
 //!
 //! 私钥永远不上送：X 在本机生成密钥对，只交 CSR（只含公钥），本服务按 CSR 签。
 
@@ -89,6 +93,12 @@ pub fn router(state: AppState) -> Router {
         // 签发上限：页面要用它把“1 年”这类超出上限的选项标出来，
         // 而不是选完被服务端静默压到 30 天。
         .route("/api/v1/policy", get(issue_policy))
+        // 认证系统（peer）是资源；旧前缀 `/api/v1/onboarding/peers` 把资源藏在了过程词后面，
+        // v0.4.1 起统一到 `/api/v1/peers`。旧路径保留**一版别名**：cred 与 cred-web 是两个
+        // 镜像，灰度期页面可能还在调旧的；下个版本删。
+        .route("/api/v1/peers", get(list_peers).post(create_peer))
+        .route("/api/v1/peers/{name}/enrollment-tickets", post(mint_script))
+        .route("/api/v1/peers/{name}/endpoint", post(set_peer_endpoint))
         .route(
             "/api/v1/onboarding/peers",
             get(list_peers).post(create_peer),
@@ -98,9 +108,11 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/onboarding/peers/{name}/endpoint",
             post(set_peer_endpoint),
         )
-        // 注意：**不在 /api 下**，入口 nginx 对这两条关掉 basic auth（取它们的是机器）。
-        .route("/onboarding/script/{token}", get(fetch_script))
-        .route("/onboarding/enroll/{token}", post(enroll_peer))
+        // 机器面：券自证。`join.sh` 可重复取（只有公开材料），真正的一次性在 `certificate`。
+        // 注意：**不在 /api 下**，入口 nginx 对这一层关掉 basic auth（取它们的是机器）。
+        // 券寿命 ≤ 1h 且一次即废，所以换名字不需要兼容别名。
+        .route("/enroll/{token}/join.sh", get(fetch_script))
+        .route("/enroll/{token}/certificate", post(enroll_peer))
         .with_state(state)
 }
 
@@ -145,17 +157,17 @@ async fn landing() -> impl IntoResponse {
             "POST /api/v1/credentials/{id}/revoke",
             "POST /api/v1/credentials/{id}/redeliver",
             "GET  /api/v1/policy",
-            "GET  /api/v1/onboarding/peers",
-            "POST /api/v1/onboarding/peers",
-            "POST /api/v1/onboarding/peers/{name}/endpoint",
-            "POST /api/v1/onboarding/peers/{name}/script",
-            "GET  /onboarding/script/{token}",
-            "POST /onboarding/enroll/{token}",
+            "GET  /api/v1/peers",
+            "POST /api/v1/peers",
+            "POST /api/v1/peers/{name}/endpoint",
+            "POST /api/v1/peers/{name}/enrollment-tickets",
+            "GET  /enroll/{token}/join.sh",
+            "POST /enroll/{token}/certificate",
         ],
         "auth": "requests under /api/v1 need `Authorization: Bearer <password>` in token mode \
                  (the page asks for it), or the operator header injected by the ingress in ingress mode; \
-                 /onboarding/{script,enroll}/{token} are authorised by the one-time ticket itself \
-                 (script: re-fetchable, enroll: single use)",
+                 /enroll/{token}/{join.sh,certificate} are authorised by the one-time ticket itself \
+                 (join.sh: re-fetchable, certificate: single use)",
     }))
 }
 
@@ -389,7 +401,7 @@ async fn mint_script(
     Json(json!({
         "peer": target.name,
         "host": target.host,
-        "path": format!("/onboarding/script/{token}"),
+        "path": format!("/enroll/{token}/join.sh"),
         "expires_in": expires_in,
     }))
     .into_response()
@@ -442,7 +454,7 @@ async fn fetch_script(
     };
 
     let enroll_url = format!(
-        "{}/onboarding/enroll/{token}",
+        "{}/enroll/{token}/certificate",
         public_base(&headers).unwrap_or_default()
     );
     let issuer_public = state
@@ -1710,10 +1722,12 @@ mod tests {
             "POST /api/v1/credentials",
             "POST /api/v1/credentials/{id}/revoke",
             "POST /api/v1/credentials/{id}/redeliver",
-            "GET  /api/v1/onboarding/peers",
-            "POST /api/v1/onboarding/peers",
-            "POST /api/v1/onboarding/peers/{name}/endpoint",
-            "POST /api/v1/onboarding/peers/{name}/script",
+            "GET  /api/v1/peers",
+            "POST /api/v1/peers",
+            "POST /api/v1/peers/{name}/endpoint",
+            "POST /api/v1/peers/{name}/enrollment-tickets",
+            "GET  /enroll/{token}/join.sh",
+            "POST /enroll/{token}/certificate",
         ] {
             assert!(endpoints.contains(&route), "landing is missing {route}");
         }
@@ -1865,7 +1879,7 @@ mod tests {
         let (status, minted) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers/wist-ingest/script",
+                "/api/v1/peers/wist-ingest/enrollment-tickets",
                 Some("0123456789abcdef01234567"),
                 "127.0.0.1",
                 None,
@@ -2277,7 +2291,7 @@ mod tests {
         harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-center", "host": "center.internal", "roles": ["investigation:run"] })),
@@ -2329,7 +2343,7 @@ mod tests {
         harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers/wist-center/endpoint",
+                "/api/v1/peers/wist-center/endpoint",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "https://center.internal:19443/api/v1/internal/credentials" })),
@@ -2402,10 +2416,27 @@ mod tests {
             .with_signer();
 
         let (status, body) = harness
-            .call("GET", "/api/v1/onboarding/peers", None, "127.0.0.1", None)
+            .call("GET", "/api/v1/peers", None, "127.0.0.1", None)
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "missing_operator");
+
+        let (status, body) = harness
+            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["peers"][0]["name"], "wist-ingest");
+        assert_eq!(body["peers"][0]["host"], "ingest.internal");
+        // 列表绝不带材料。
+        assert!(body["peers"][0].get("server_cert").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_paths_keep_working_for_one_release() {
+        // cred 与 cred-web 是两个镜像：灰度期页面可能还在调旧前缀。
+        let harness = Harness::new()
+            .with_peer("wist-ingest", "ingest.internal")
+            .with_signer();
 
         let (status, body) = harness
             .call(
@@ -2418,16 +2449,6 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["peers"][0]["name"], "wist-ingest");
-        assert_eq!(body["peers"][0]["host"], "ingest.internal");
-        // 列表绝不带材料。
-        assert!(body["peers"][0].get("server_cert").is_none());
-    }
-
-    #[tokio::test]
-    async fn onboarding_script_link_is_single_use() {
-        let harness = Harness::new()
-            .with_peer("wist-ingest", "ingest.internal")
-            .with_signer();
 
         let (status, minted) = harness
             .call(
@@ -2439,8 +2460,50 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::OK);
+        // 旧入口发的券也指向**新**路径，页面不需要感知改名。
+        assert!(
+            minted["path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("/enroll/"),
+            "got {minted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_machine_paths_are_gone() {
+        // 券寿命 ≤ 1h 且一次即废，所以机器面不留别名。
+        let harness = Harness::new()
+            .with_peer("wist-ingest", "ingest.internal")
+            .with_signer();
+        for (method, uri) in [
+            ("GET", "/onboarding/script/wot_deadbeef"),
+            ("POST", "/onboarding/enroll/wot_deadbeef"),
+        ] {
+            let (status, _) = harness.call(method, uri, None, "127.0.0.1", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn onboarding_script_link_is_single_use() {
+        let harness = Harness::new()
+            .with_peer("wist-ingest", "ingest.internal")
+            .with_signer();
+
+        let (status, minted) = harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-ingest/enrollment-tickets",
+                Some("alice"),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
         let path = minted["path"].as_str().expect("path").to_string();
-        assert!(path.starts_with("/onboarding/script/wot_"), "got {path}");
+        assert!(path.starts_with("/enroll/wot_"), "got {path}");
+        assert!(path.ends_with("/join.sh"), "got {path}");
 
         // X 取脚本：没有操作者头，靠券本身授权。
         let (status, script) = harness.call_text("GET", &path, None, "127.0.0.1").await;
@@ -2466,7 +2529,7 @@ mod tests {
         let (_, minted) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers/wist-ingest/script",
+                "/api/v1/peers/wist-ingest/enrollment-tickets",
                 Some("alice"),
                 "127.0.0.1",
                 None,
@@ -2484,7 +2547,7 @@ mod tests {
         let (status, body) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers/wist-ingest/script",
+                "/api/v1/peers/wist-ingest/enrollment-tickets",
                 Some("alice"),
                 "127.0.0.1",
                 None,
@@ -2500,7 +2563,7 @@ mod tests {
         let (status, body) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers/nope/script",
+                "/api/v1/peers/nope/enrollment-tickets",
                 Some("alice"),
                 "127.0.0.1",
                 None,
@@ -2520,7 +2583,7 @@ mod tests {
         let (status, _) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 None,
                 "127.0.0.1",
                 Some(body.clone()),
@@ -2531,7 +2594,7 @@ mod tests {
         let (status, created) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(body),
@@ -2552,7 +2615,7 @@ mod tests {
         let (first, _) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(body.clone()),
@@ -2562,7 +2625,7 @@ mod tests {
         let (second, error) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("bob"),
                 "127.0.0.1",
                 Some(body),
@@ -2578,7 +2641,7 @@ mod tests {
         let (status, body) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "name": "x", "host": "x.internal" })),
@@ -2594,7 +2657,7 @@ mod tests {
         let (status, created) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-ingest", "host": "ingest.internal" })),
@@ -2667,7 +2730,7 @@ mod tests {
         let (status, _) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-ingest", "roles": ["read"] })),
@@ -2707,7 +2770,7 @@ mod tests {
         let (status, rejected) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({
@@ -2725,7 +2788,7 @@ mod tests {
         harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(
@@ -2736,7 +2799,7 @@ mod tests {
         let (status, rejected) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers/wist-ingest/endpoint",
+                "/api/v1/peers/wist-ingest/endpoint",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "https://$(id)/api" })),
@@ -2767,13 +2830,7 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK);
         let (_, listed) = harness
-            .call(
-                "GET",
-                "/api/v1/onboarding/peers",
-                Some("alice"),
-                "127.0.0.1",
-                None,
-            )
+            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
             .await;
         assert_eq!(
             listed["peers"][0]["endpoint"],
@@ -2784,7 +2841,7 @@ mod tests {
     #[tokio::test]
     async fn an_endpoint_can_be_set_and_cleared_through_the_api() {
         let harness = Harness::new().with_peer("wist-ingest", "ingest.internal");
-        let uri = "/api/v1/onboarding/peers/wist-ingest/endpoint";
+        let uri = "/api/v1/peers/wist-ingest/endpoint";
 
         let (status, body) = harness
             .call(
@@ -2836,7 +2893,7 @@ mod tests {
         let (status, _) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers/nope/endpoint",
+                "/api/v1/peers/nope/endpoint",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "endpoint": null })),
@@ -2852,7 +2909,7 @@ mod tests {
         let (status, created) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-ingest" })),
@@ -2884,13 +2941,7 @@ mod tests {
         assert!(info.subject.contains("ingest.internal"), "{}", info.subject);
 
         let (_, listed) = harness
-            .call(
-                "GET",
-                "/api/v1/onboarding/peers",
-                Some("alice"),
-                "127.0.0.1",
-                None,
-            )
+            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
             .await;
         assert_eq!(listed["peers"][0]["host"], "ingest.internal");
         assert_eq!(
@@ -2905,7 +2956,7 @@ mod tests {
         let (_, _) = harness
             .call(
                 "POST",
-                "/api/v1/onboarding/peers",
+                "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-ingest" })),
@@ -2964,13 +3015,7 @@ mod tests {
     async fn listing_peers_reports_health_and_probe_url() {
         let harness = Harness::new().with_peer("wist-ingest", "ingest.internal");
         let (status, body) = harness
-            .call(
-                "GET",
-                "/api/v1/onboarding/peers",
-                Some("alice"),
-                "127.0.0.1",
-                None,
-            )
+            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["peers"][0]["health"], "unknown");
@@ -2997,7 +3042,7 @@ mod tests {
         let (status, minted) = harness
             .call(
                 "POST",
-                &format!("/api/v1/onboarding/peers/{peer}/script"),
+                &format!("/api/v1/peers/{peer}/enrollment-tickets"),
                 Some("alice"),
                 "127.0.0.1",
                 None,
@@ -3005,8 +3050,10 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK);
         let path = minted["path"].as_str().expect("path");
-        let token = path.rsplit('/').next().expect("token");
-        format!("/onboarding/enroll/{token}")
+        let token = path
+            .trim_start_matches("/enroll/")
+            .trim_end_matches("/join.sh");
+        format!("/enroll/{token}/certificate")
     }
 
     #[tokio::test]

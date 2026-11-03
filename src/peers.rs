@@ -8,7 +8,7 @@
 //! 1. **PKI 种子**（`onboarding.dir/*/peer.json`）：部署阶段由 `scripts/gen-pki.sh` 写，
 //!    首次启动导入一次；已在注册表里的不覆盖。
 //! 2. **API 创建**（`POST /api/v1/onboarding/peers`）：人在页面上建。
-//! 3. **登记回填**（`POST /onboarding/enroll/{券}`）：X 交 CSR 时可以带上自己的收数地址，
+//! 3. **登记回填**（`POST /enroll/{券}/certificate`）：X 交 CSR 时可以带上自己的收数地址，
 //!    只补空字段，不改已有值。
 //!
 //! 心跳状态**不落盘**：它十分钟就过时了，重启后应该老老实实显示"未知"，等第一次探测。

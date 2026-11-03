@@ -283,6 +283,37 @@ mod tests {
     }
 
     #[test]
+    fn install_dir_never_demands_root() {
+        // 能不能装只取决于目录写不写得进去；在栈目录下跑不该提权。
+        let peer = Peer {
+            name: "wist-center".to_string(),
+            host: Some("center.internal".to_string()),
+            endpoint: None,
+            healthz: None,
+            roles: Vec::new(),
+            created_at: 0,
+            created_by: "alice".to_string(),
+        };
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script = render_script(&peer, ca, "https://cred.internal/x", None).expect("render");
+
+        assert!(!script.contains("请用 root 运行"), "脚本不得硬性要求 root");
+        assert!(
+            script.contains("INSTALL_DIR=\"./wist-cred/$PEER_NAME\""),
+            "非 root 默认应当落在当前目录下"
+        );
+        assert!(
+            script.contains("INSTALL_DIR=\"/etc/wist/$PEER_NAME\""),
+            "root 仍默认 /etc（systemd 部署不回退）"
+        );
+        assert!(
+            script.contains("[[ -w \"$INSTALL_DIR\" ]]"),
+            "改用可写性闸门"
+        );
+        assert!(script.contains("WIST_CRED_INSTALL_DIR"), "环境变量仍可覆盖");
+    }
+
+    #[test]
     fn render_escapes_single_quotes_in_embedded_values() {
         // 上游已经限了字符集；万一漏进来一个 `'`，也不能让它跳出 shell 字面量。
         let peer = Peer {

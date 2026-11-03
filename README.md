@@ -26,12 +26,12 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `GET /api/v1/credentials/{id}` | 单条 |
 | `POST /api/v1/credentials/{id}/revoke` | 撤销（幂等：重放不重复升 revision） |
 | `GET /api/v1/policy` | 签发策略：`max_ttl_seconds` / `break_glass_max_ttl_seconds`（页面用它把超限选项标出来） |
-| `GET /api/v1/onboarding/peers` | 列出认证系统（含**心跳状态**：`unknown` / `up`+延迟 / `down`+原因） |
-| `POST /api/v1/onboarding/peers` | 新建认证系统（名称 / 主机名 / 收数地址）；落 `state/peers.json`，**不需重启** |
-| `POST /api/v1/onboarding/peers/{name}/endpoint` | 改收数地址（`null` = 退回手工分发），下一轮心跳即生效 |
-| `POST /api/v1/onboarding/peers/{name}/script` | 签一张**一次性**接入券（默认 900s） |
-| `GET /onboarding/script/{token}` | 取出接入脚本（**只有公开材料 + 券，无任何私钥**） |
-| `POST /onboarding/enroll/{token}` | X 交 CSR 换自己的服务器证书（**兑现券**，一次性） |
+| `GET /api/v1/peers` | 列出认证系统（含**心跳状态**：`unknown` / `up`+延迟 / `down`+原因） |
+| `POST /api/v1/peers` | 新建认证系统（名称 / 主机名 / 收数地址）；落 `state/peers.json`，**不需重启** |
+| `POST /api/v1/peers/{name}/endpoint` | 改收数地址（`null` = 退回手工分发），下一轮心跳即生效 |
+| `POST /api/v1/peers/{name}/enrollment-tickets` | 签一张**一次性**接入券（默认 900s） |
+| `GET /enroll/{token}/join.sh` | 取出接入脚本（**只有公开材料 + 券，无任何私钥**） |
+| `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**，一次性） |
 | `GET /healthz` / `GET /version` | 探针 |
 
 ### 创建

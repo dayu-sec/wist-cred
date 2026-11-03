@@ -28,7 +28,9 @@ PEER_ENDPOINT='__PEER_ENDPOINT__'
 PEER_ROLES='__PEER_ROLES__'
 ENROLL_URL='__ENROLL_URL__'
 
-INSTALL_DIR="${WIST_CRED_INSTALL_DIR:-/etc/wist/$PEER_NAME}"
+# 材料目录：显式给了就用（--dir / WIST_CRED_INSTALL_DIR）；否则按**当前身份**取默认值，
+# 见下面「检查前置条件」。
+INSTALL_DIR="${WIST_CRED_INSTALL_DIR:-}"
 CONFIG_FILE=""
 RESTART_CMD=""
 CA_CERT=""
@@ -41,7 +43,7 @@ usage() {
   cat <<'USAGE'
 用法: bash -s -- [选项]
 
-  --dir <dir>       材料安装目录（默认 /etc/wist/<peer>）
+  --dir <dir>       材料安装目录（默认：root → /etc/wist/<peer>；普通用户 → ./wist-cred/<peer>）
   --config <file>   把配置片段追加进这个 TOML（默认只打印，不改任何文件）
   --restart <cmd>   落盘后执行的重启命令（例如 'systemctl restart wist-ingest-ctrl'）
   --cacert <pem>    校验签发方 TLS 的 CA（默认 -k，见下）
@@ -52,7 +54,9 @@ usage() {
                     重跑本脚本会**覆盖**对方那边的角色表（空 = 不改）
   -h, --help        显示本帮助
 
-需要 root（要写 /etc）。不带 --config 时本脚本只落材料并打印片段。
+不要求 root，只要求材料目录可写：容器栈部署就 cd 到栈根直接跑（材料落 ./wist-cred/<peer>），
+或用 --dir 指到栈里的目录（例如 --dir ./identity/<peer>）；systemd 式部署用 root 跑即落 /etc/wist/<peer>。
+不带 --config 时本脚本只落材料并打印片段。
 重复运行是安全的：已有私钥不覆盖，同一段配置会被原位替换。
 
 关于 -k：入口的 TLS 证书通常是自签的（平台部署惯例，center 的安装脚本同样用
@@ -80,10 +84,24 @@ done
 
 # ── 前置检查 ────────────────────────────────────────────────────────────────
 step "检查前置条件"
-[[ "$(id -u)" == "0" ]] || die "请用 root 运行（要写 ${INSTALL_DIR}）"
 command -v openssl >/dev/null 2>&1 || die "需要 openssl"
 command -v curl >/dev/null 2>&1 || die "需要 curl"
-say "root ✓   openssl ✓   curl ✓"
+
+# 不按“是不是 root”拦人：能不能装材料只看**目录写不写得进去**。
+# root 只是为了让默认的 /etc/wist/<peer> 可写；在栈目录下跑不必提权。
+if [[ -z "$INSTALL_DIR" ]]; then
+  if [[ "$(id -u)" == "0" ]]; then
+    INSTALL_DIR="/etc/wist/$PEER_NAME"
+  else
+    INSTALL_DIR="./wist-cred/$PEER_NAME"
+  fi
+fi
+if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+  die "建不了材料目录：${INSTALL_DIR}（非 root 默认落 ./wist-cred/${PEER_NAME}；要写 /etc 请用 root 跑，或用 --dir 指到可写目录）"
+fi
+[[ -w "$INSTALL_DIR" ]] \
+  || die "材料目录不可写：${INSTALL_DIR}（用 --dir 指到可写目录，或该目录换个属主）"
+say "openssl ✓   curl ✓   材料目录 ${INSTALL_DIR} ✓"
 
 # ── 确定身份：主机名（证书 SAN）与收数地址 ────────────────────────
 step "确定本机身份"
