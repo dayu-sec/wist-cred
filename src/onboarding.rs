@@ -117,6 +117,8 @@ pub fn render_script(
     client_ca_pem: &str,
     enroll_url: &str,
     issuer_public_hex: Option<&str>,
+    config_path: Option<&str>,
+    restart_cmd: Option<&str>,
 ) -> anyhow::Result<String> {
     if !client_ca_pem.contains("-----BEGIN") {
         anyhow::bail!("client CA is not a PEM");
@@ -139,6 +141,14 @@ pub fn render_script(
         )
         .replace("__ENROLL_URL__", &shell_single_quoted(enroll_url))
         .replace("__ISSUER_SIGNING_PUB__", issuer_public_hex.unwrap_or(""))
+        .replace(
+            "__CONFIG_FILE__",
+            &shell_single_quoted(config_path.unwrap_or("")),
+        )
+        .replace(
+            "__RESTART_CMD__",
+            &shell_single_quoted(restart_cmd.unwrap_or("")),
+        )
         .replace("__CLIENT_CA_PEM__", client_ca_pem.trim_end()))
 }
 
@@ -250,6 +260,8 @@ mod tests {
             roles: vec![],
             created_at: 0,
             created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
         let script = render_script(
@@ -257,6 +269,8 @@ mod tests {
             ca,
             "https://cred.internal/onboarding/enroll/wot_x",
             Some(&"ab".repeat(32)),
+            None,
+            None,
         )
         .expect("render");
 
@@ -293,9 +307,12 @@ mod tests {
             roles: Vec::new(),
             created_at: 0,
             created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
-        let script = render_script(&peer, ca, "https://cred.internal/x", None).expect("render");
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
 
         assert!(!script.contains("请用 root 运行"), "脚本不得硬性要求 root");
         assert!(
@@ -314,6 +331,81 @@ mod tests {
     }
 
     #[test]
+    fn setup_target_is_embedded_into_the_script() {
+        // 「自带 --config」的实现点：落点存在认证系统上，签发时烘进脚本，
+        // 所以命令永远就一行，不用为了补参数再开一张券。
+        let peer = Peer {
+            name: "wist-center".to_string(),
+            host: Some("center.internal".to_string()),
+            endpoint: None,
+            healthz: None,
+            roles: Vec::new(),
+            created_at: 0,
+            created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
+        };
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script = render_script(
+            &peer,
+            ca,
+            "https://cred.internal/x",
+            None,
+            Some("/etc/wist/center/control-center.toml"),
+            Some("systemctl restart wist-center"),
+        )
+        .expect("render");
+
+        assert!(
+            script.contains(
+                "CONFIG_FILE=\"${WIST_CRED_CONFIG_FILE:-/etc/wist/center/control-center.toml}\""
+            ),
+            "配置文件应当作为默认值内嵌"
+        );
+        assert!(
+            script.contains(
+                "RESTART_CMD=\"${WIST_CRED_RESTART_CMD:-systemctl restart wist-center}\""
+            ),
+            "重启命令应当作为默认值内嵌"
+        );
+
+        // 没配就不带（保持“只落材料 + 打印片段”的旧行为）。
+        let plain =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
+        assert!(plain.contains("CONFIG_FILE=\"${WIST_CRED_CONFIG_FILE:-}\""));
+        assert!(plain.contains("RESTART_CMD=\"${WIST_CRED_RESTART_CMD:-}\""));
+    }
+
+    #[test]
+    fn setup_target_escapes_single_quotes() {
+        let peer = Peer {
+            name: "wist-ingest".to_string(),
+            host: Some("ingest.internal".to_string()),
+            endpoint: None,
+            healthz: None,
+            roles: Vec::new(),
+            created_at: 0,
+            created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
+        };
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script = render_script(
+            &peer,
+            ca,
+            "https://cred.internal/x",
+            None,
+            Some("/etc/o'brien/x.toml"),
+            None,
+        )
+        .expect("render");
+        assert!(
+            script.contains(r"WIST_CRED_CONFIG_FILE:-/etc/o'\''brien/x.toml"),
+            "单引号必须转义（否则跳出 shell 字面量）"
+        );
+    }
+
+    #[test]
     fn render_escapes_single_quotes_in_embedded_values() {
         // 上游已经限了字符集；万一漏进来一个 `'`，也不能让它跳出 shell 字面量。
         let peer = Peer {
@@ -324,9 +416,12 @@ mod tests {
             roles: vec!["read".to_string(), "weird'role".to_string()],
             created_at: 0,
             created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
-        let script = render_script(&peer, ca, "https://cred.internal/x", None).expect("render");
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
         assert!(
             script.contains(r"PEER_ROLES='read,weird'\''role'"),
             "role quote must be escaped, got: {script}"
@@ -347,8 +442,11 @@ mod tests {
             roles: vec![],
             created_at: 0,
             created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
         };
-        let err = render_script(&peer, "not a pem", "https://x/y", None).expect_err("must reject");
+        let err = render_script(&peer, "not a pem", "https://x/y", None, None, None)
+            .expect_err("must reject");
         assert!(err.to_string().contains("not a PEM"), "unexpected: {err}");
     }
 
@@ -362,13 +460,15 @@ mod tests {
             roles: Vec::new(),
             created_at: 0,
             created_by: "alice".to_string(),
+            config_path: None,
+            restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
         let hex = "ab".repeat(32);
-        let script =
-            render_script(&peer, ca, "https://cred.internal/x", Some(&hex)).expect("render");
+        let script = render_script(&peer, ca, "https://cred.internal/x", Some(&hex), None, None)
+            .expect("render");
         assert!(script.contains(&hex), "public key must be embedded");
-        let err = render_script(&peer, ca, "https://cred.internal/x", Some("zz"))
+        let err = render_script(&peer, ca, "https://cred.internal/x", Some("zz"), None, None)
             .expect_err("must reject");
         assert!(err.to_string().contains("hex"), "unexpected: {err}");
     }

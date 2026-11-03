@@ -99,6 +99,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/peers", get(list_peers).post(create_peer))
         .route("/api/v1/peers/{name}/enrollment-tickets", post(mint_script))
         .route("/api/v1/peers/{name}/endpoint", post(set_peer_endpoint))
+        // 接入落点（配置文件 + 重启命令）：挂在系统上，签发时烘进脚本。
+        .route("/api/v1/peers/{name}/setup", post(set_peer_setup))
         .route(
             "/api/v1/onboarding/peers",
             get(list_peers).post(create_peer),
@@ -223,6 +225,8 @@ fn peer_view(peer: &Peer, health: &Health) -> Value {
         "endpoint": peer.endpoint,
         "probe_url": peer.probe_url(),
         "roles": peer.roles,
+        "config_path": peer.config_path,
+        "restart_cmd": peer.restart_cmd,
         "created_at": peer.created_at,
         "created_by": peer.created_by,
         "health": state,
@@ -278,6 +282,9 @@ async fn create_peer(
         endpoint: body.endpoint,
         healthz: body.healthz,
         roles: body.roles,
+        // 建的时候不填：接入落点是后续在页面上改的（与“只填名称”同一取向）。
+        config_path: None,
+        restart_cmd: None,
     };
     match state.peers.create(input, &operator) {
         Ok(created) => {
@@ -340,6 +347,73 @@ async fn set_peer_endpoint(
                 "peer endpoint updated: name={} endpoint={:?} by={operator}",
                 updated.name,
                 updated.endpoint
+            );
+            Json(peer_view(&updated, &state.peers.health(&updated.name))).into_response()
+        }
+        Err(PeerError::BadRequest(message)) => {
+            err(StatusCode::BAD_REQUEST, "invalid_peer", message)
+        }
+        Err(PeerError::NotFound(_)) => err(
+            StatusCode::NOT_FOUND,
+            "unknown_peer",
+            format!("no auth system named {name:?}"),
+        ),
+        Err(PeerError::Conflict(message)) => err(StatusCode::CONFLICT, "peer_conflict", message),
+        Err(PeerError::Store(message)) => {
+            log::error!("peer store failed: {message}");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_unavailable",
+                "failed to persist the peer",
+            )
+        }
+    }
+}
+
+/// 改“接入落点”：接入脚本要不要顺手写配置、写完要不要重启。
+///
+/// 挂在**认证系统**上而不是每条券上：这是该系统的事实（与 host / roles 同类），
+/// 下一次点「接入命令」就自带 —— 不用为了补 `--config` 再开一张券。
+///
+/// 注意：栈部署的系统（center / ingest）**不要填** `config_path` —— 它们的配置由
+/// localize 渲染、只读挂载，脚本写进去会被下一次渲染覆盖。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSetupRequest {
+    /// X 上那份配置文件的路径；`null` / 空串 = 不写文件（只打印片段）。
+    #[serde(default)]
+    config_path: Option<String>,
+    /// 写完后让配置生效的命令；`null` / 空串 = 只提示。
+    #[serde(default)]
+    restart_cmd: Option<String>,
+}
+
+async fn set_peer_setup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<SetSetupRequest>,
+) -> Response {
+    let operator = match authorize(&state.config, peer, &headers) {
+        Ok(operator) => operator,
+        Err(denied) => return denied.into_response(),
+    };
+    match state.peers.set_setup(
+        &name,
+        body.config_path.as_deref(),
+        body.restart_cmd.as_deref(),
+    ) {
+        Ok(updated) => {
+            log::info!(
+                "peer setup updated: name={} config_path={:?} restart={} by={operator}",
+                updated.name,
+                updated.config_path,
+                if updated.restart_cmd.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             Json(peer_view(&updated, &state.peers.health(&updated.name))).into_response()
         }
@@ -468,6 +542,8 @@ async fn fetch_script(
         &client_ca,
         &enroll_url,
         issuer_public.as_deref(),
+        target.config_path.as_deref(),
+        target.restart_cmd.as_deref(),
     ) {
         Ok(script) => {
             log::info!(
@@ -1592,6 +1668,8 @@ mod tests {
                         endpoint: Some(format!("https://{host}:19443/api/v1/internal/credentials")),
                         healthz: None,
                         roles: roles.iter().map(|role| (*role).to_string()).collect(),
+                        config_path: None,
+                        restart_cmd: None,
                     },
                     "test",
                 )
@@ -1610,6 +1688,8 @@ mod tests {
                         endpoint: None,
                         healthz: None,
                         roles: roles.iter().map(|role| (*role).to_string()).collect(),
+                        config_path: None,
+                        restart_cmd: None,
                     },
                     "test",
                 )
@@ -2539,6 +2619,65 @@ mod tests {
         }
         // 没有 Host 宁可返回 None（调用方再用空串），也不要拼出一个半残地址。
         assert_eq!(public_base(&server, &HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn setup_endpoint_is_remembered_and_reaches_the_script() {
+        // “命令自带 --config”的端到端：存一次，之后每次签发的脚本都带着它。
+        let harness = Harness::new()
+            .with_peer("wist-ingest", "ingest.internal")
+            .with_signer();
+
+        let (status, body) = harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-ingest/setup",
+                Some("alice"),
+                "127.0.0.1",
+                Some(json!({
+                    "config_path": "/etc/x/ctrl.toml",
+                    "restart_cmd": "systemctl restart x"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["config_path"], "/etc/x/ctrl.toml");
+        assert_eq!(body["restart_cmd"], "systemctl restart x");
+
+        let (status, minted) = harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-ingest/enrollment-tickets",
+                Some("alice"),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let path = minted["path"].as_str().expect("path");
+        let (status, script) = harness.call_text("GET", path, None, "127.0.0.1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            script.contains("WIST_CRED_CONFIG_FILE:-/etc/x/ctrl.toml"),
+            "脚本里应当自带配置文件\ngot: {script}"
+        );
+        assert!(
+            script.contains("WIST_CRED_RESTART_CMD:-systemctl restart x"),
+            "脚本里应当自带重启命令\ngot: {script}"
+        );
+
+        // 换行要在入口就拦住：它是单行 shell 赋值。
+        let (status, body) = harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-ingest/setup",
+                Some("alice"),
+                "127.0.0.1",
+                Some(json!({"config_path": "/etc/x\nrm -rf /"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_peer");
     }
 
     #[tokio::test]

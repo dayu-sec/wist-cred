@@ -50,6 +50,16 @@ pub struct Peer {
     pub created_at: i64,
     /// `pki` = 部署种子；否则是操作者名。
     pub created_by: String,
+    /// X 上那份**由人维护**的运行配置（接入脚本 `--config` 的写入目标）。
+    /// `None` = 只打印片段，不写任何文件。
+    /// 栈部署的服务（center / ingest）**不要填**：它们的配置由 localize 渲染、只读挂载，
+    /// 写了也会被下一次渲染覆盖 —— 那些系统改模板。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// 写完配置后让它生效的命令（`--restart`），例如 `systemctl restart x`。
+    /// `None` = 只提示重启，不替人执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_cmd: Option<String>,
 }
 
 impl Peer {
@@ -299,6 +309,16 @@ impl PeerRegistry {
             roles: normalize_roles(input.roles).map_err(PeerError::BadRequest)?,
             created_at: now_secs(),
             created_by: by.to_string(),
+            config_path: clean_setup(
+                input.config_path.as_deref(),
+                "config_path",
+                validate_setup_path,
+            )?,
+            restart_cmd: clean_setup(
+                input.restart_cmd.as_deref(),
+                "restart_cmd",
+                validate_setup_cmd,
+            )?,
         };
 
         let mut state = self.lock();
@@ -416,6 +436,40 @@ impl PeerRegistry {
         state.health.remove(name);
         Ok(updated)
     }
+
+    /// 改“接入落点”：接入脚本要不要顺手写配置、写完要不要重启。
+    ///
+    /// 与 `set_endpoint` 同一套落盘 / 回滚；这里**不动健康结论** —— 它不改变可达性。
+    pub fn set_setup(
+        &self,
+        name: &str,
+        config_path: Option<&str>,
+        restart_cmd: Option<&str>,
+    ) -> Result<Peer, PeerError> {
+        let config_path = clean_setup(config_path, "config_path", validate_setup_path)?;
+        let restart_cmd = clean_setup(restart_cmd, "restart_cmd", validate_setup_cmd)?;
+
+        let mut state = self.lock();
+        let Some(peer) = state.peers.get_mut(name) else {
+            return Err(PeerError::NotFound(name.to_string()));
+        };
+        let previous = (peer.config_path.clone(), peer.restart_cmd.clone());
+        peer.config_path = config_path;
+        peer.restart_cmd = restart_cmd;
+        let updated = peer.clone();
+        let revision = state.revision;
+        state.revision += 1;
+        let snapshot = snapshot(&state);
+        if let Err(error) = write(&self.path, &snapshot) {
+            if let Some(peer) = state.peers.get_mut(name) {
+                peer.config_path = previous.0;
+                peer.restart_cmd = previous.1;
+            }
+            state.revision = revision;
+            return Err(PeerError::Store(format!("{error:#}")));
+        }
+        Ok(updated)
+    }
 }
 
 /// 页面/API 传来的新建请求。
@@ -428,6 +482,9 @@ pub struct NewPeer {
     pub healthz: Option<String>,
     /// 可选：对方能验的角色。同上。
     pub roles: Vec<String>,
+    /// 可选：接入脚本要不要顺手写配置、写完要不要重启（见 `Peer::config_path`）。
+    pub config_path: Option<String>,
+    pub restart_cmd: Option<String>,
 }
 
 #[derive(Debug)]
@@ -559,6 +616,42 @@ pub(crate) fn validate_report(
     Ok(())
 }
 
+/// 取值 + 校验一条“接入落点”字段：去空白、空当没给。
+fn clean_setup(
+    value: Option<&str>,
+    field: &str,
+    validate: fn(&str) -> Result<(), String>,
+) -> Result<Option<String>, PeerError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    validate(value).map_err(|reason| PeerError::BadRequest(format!("{field}: {reason}")))?;
+    Ok(Some(value.to_string()))
+}
+
+/// 配置文件路径：只挡**不可能是一行路径**的东西（换行/控制字符）。
+/// 不做绝对路径要求：相对路径是相对**对方机器当时的 cwd** 解，那是它自己的事。
+fn validate_setup_path(value: &str) -> Result<(), String> {
+    if value.len() > 512 {
+        return Err("must be at most 512 bytes".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("must not contain control characters".to_string());
+    }
+    Ok(())
+}
+
+/// 重启命令：脚本里是**单行**赋值，换行会把后面的内容变成新的命令。
+fn validate_setup_cmd(value: &str) -> Result<(), String> {
+    if value.len() > 512 {
+        return Err("must be at most 512 bytes".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("must be a single line without control characters".to_string());
+    }
+    Ok(())
+}
+
 fn validate_name(name: &str) -> Result<(), PeerError> {
     if name.is_empty() {
         return Err(PeerError::BadRequest("name must not be empty".to_string()));
@@ -662,6 +755,9 @@ impl RawPeerSeed {
             roles,
             created_at: now_secs(),
             created_by: "pki".to_string(),
+            // 种子不带接入落点：它是给对方机器看的，不是写配置的。
+            config_path: None,
+            restart_cmd: None,
         })
     }
 }
@@ -709,7 +805,52 @@ mod tests {
                 "https://{name}.internal:19443/api/v1/internal/credentials"
             )),
             healthz: None,
+            config_path: None,
+            restart_cmd: None,
         }
+    }
+
+    #[test]
+    fn setup_fields_round_trip_and_reject_control_characters() {
+        let dir = TempDir::new();
+        let reg = registry(&dir);
+        reg.create(new_peer("ingest"), "alice").unwrap();
+
+        let updated = reg
+            .set_setup(
+                "ingest",
+                Some("  /etc/x/ctrl.toml  "),
+                Some("systemctl restart x"),
+            )
+            .expect("setup persists");
+        assert_eq!(
+            updated.config_path.as_deref(),
+            Some("/etc/x/ctrl.toml"),
+            "两端空白要去掉"
+        );
+        assert_eq!(updated.restart_cmd.as_deref(), Some("systemctl restart x"));
+
+        // 重开也能读到（它跟 host / roles 一样是系统事实，不能只在内存里）。
+        let reopened = registry(&dir);
+        let peer = reopened.get("ingest").expect("peer survives reopen");
+        assert_eq!(peer.config_path.as_deref(), Some("/etc/x/ctrl.toml"));
+
+        // 清空 = 回到“只打印片段”。
+        let cleared = reg.set_setup("ingest", None, None).unwrap();
+        assert!(cleared.config_path.is_none() && cleared.restart_cmd.is_none());
+
+        // 换行会把后面的内容变成新命令：必须拦在写盘之前。
+        let err = reg
+            .set_setup("ingest", Some("/etc/x\nrm -rf /"), None)
+            .expect_err("newline must be rejected");
+        assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
+        let err = reg
+            .set_setup("ingest", None, Some("a\nb"))
+            .expect_err("newline must be rejected");
+        assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
+
+        let err = reg.set_setup("nope", Some("/x"), None).unwrap_err();
+        assert!(matches!(err, PeerError::NotFound(_)), "got {err:?}");
     }
 
     #[test]
@@ -774,6 +915,8 @@ mod tests {
             healthz: None,
             created_at: 0,
             created_by: "x".into(),
+            config_path: None,
+            restart_cmd: None,
         };
         assert_eq!(peer.probe_url().as_deref(), Some("https://h:19443/healthz"));
 
@@ -974,6 +1117,8 @@ mod tests {
                     endpoint: None,
                     healthz: None,
                     roles: Vec::new(),
+                    config_path: None,
+                    restart_cmd: None,
                 },
                 "alice",
             )
@@ -995,6 +1140,8 @@ mod tests {
                     endpoint: Some("https://ingest.internal:19443/x".to_string()),
                     healthz: None,
                     roles: Vec::new(),
+                    config_path: None,
+                    restart_cmd: None,
                 },
                 "alice",
             )

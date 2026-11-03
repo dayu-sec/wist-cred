@@ -29,6 +29,7 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `GET /api/v1/peers` | 列出认证系统（含**心跳状态**：`unknown` / `up`+延迟 / `down`+原因） |
 | `POST /api/v1/peers` | 新建认证系统（名称 / 主机名 / 收数地址）；落 `state/peers.json`，**不需重启** |
 | `POST /api/v1/peers/{name}/endpoint` | 改收数地址（`null` = 退回手工分发），下一轮心跳即生效 |
+| `POST /api/v1/peers/{name}/setup` | 接入落点：要不要顺手写配置（`config_path`）/ 重启（`restart_cmd`） |
 | `POST /api/v1/peers/{name}/enrollment-tickets` | 签一张**一次性**接入券（默认 900s） |
 | `GET /enroll/{token}/join.sh` | 取出接入脚本（**只有公开材料 + 券，无任何私钥**） |
 | `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**，一次性） |

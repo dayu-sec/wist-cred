@@ -93,6 +93,8 @@ async fn main() -> anyhow::Result<()> {
                 endpoint: None,
                 healthz: None,
                 roles: vec!["investigation:run".to_string()],
+                config_path: None,
+                restart_cmd: None,
             },
             "closed-loop",
         )
