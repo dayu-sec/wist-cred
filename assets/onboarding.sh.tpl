@@ -77,14 +77,14 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dir)      [[ $# -ge 2 ]] || die "--dir 需要一个值";      INSTALL_DIR="$2"; shift 2 ;;
-    --config)   [[ $# -ge 2 ]] || die "--config 需要一个值";    CONFIG_FILE="$2"; shift 2 ;;
-    --restart)  [[ $# -ge 2 ]] || die "--restart 需要一个值";   RESTART_CMD="$2"; shift 2 ;;
-    --cacert)   [[ $# -ge 2 ]] || die "--cacert 需要一个值";    CA_CERT="$2"; shift 2 ;;
-    --endpoint) [[ $# -ge 2 ]] || die "--endpoint 需要一个值";  ENROLL_URL="$2"; shift 2 ;;
-    --host)     [[ $# -ge 2 ]] || die "--host 需要一个值";      PEER_HOST="$2"; shift 2 ;;
-    --advertise) [[ $# -ge 2 ]] || die "--advertise 需要一个值"; PEER_ENDPOINT="$2"; shift 2 ;;
-    --roles)    [[ $# -ge 2 ]] || die "--roles 需要一个值";     PEER_ROLES="$2"; shift 2 ;;
+    --dir)      [[ $# -ge 2 ]] || die "--dir 需要一个值（材料目录，例如：bash -s -- --dir ./identity/x）"; INSTALL_DIR="$2"; shift 2 ;;
+    --config)   [[ $# -ge 2 ]] || die "--config 需要一个值（例如：bash -s -- --config /etc/x/app.toml）"; CONFIG_FILE="$2"; shift 2 ;;
+    --restart)  [[ $# -ge 2 ]] || die "--restart 需要一个值（例如：bash -s -- --restart 'systemctl restart x'）"; RESTART_CMD="$2"; shift 2 ;;
+    --cacert)   [[ $# -ge 2 ]] || die "--cacert 需要一个值（PEM 路径）";    CA_CERT="$2"; shift 2 ;;
+    --endpoint) [[ $# -ge 2 ]] || die "--endpoint 需要一个值（登记地址）";  ENROLL_URL="$2"; shift 2 ;;
+    --host)     [[ $# -ge 2 ]] || die "--host 需要一个值（证书 SAN）";      PEER_HOST="$2"; shift 2 ;;
+    --advertise) [[ $# -ge 2 ]] || die "--advertise 需要一个值（收数地址）"; PEER_ENDPOINT="$2"; shift 2 ;;
+    --roles)    [[ $# -ge 2 ]] || die "--roles 需要一个值（逗号分隔，如 admin,read）";     PEER_ROLES="$2"; shift 2 ;;
     -h|--help)  usage; exit 0 ;;
     *)          die "未知参数：$1（-h 看用法）" ;;
   esac

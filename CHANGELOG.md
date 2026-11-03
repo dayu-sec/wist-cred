@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.5-alpha] - 2026-11-03
+
+### 修复：参数缺值时的报错不再只给一句“需要一个值”
+
+现场把 `--config` 写成光杆（`| bash -s -- --config`），只得到 `--config 需要一个值`，
+还得自己去翻用法。现在每个选项缺值时都直接给出**完整可粘贴的写法**：
+
+```
+--config 需要一个值（例如：bash -s -- --config /etc/x/app.toml）
+--restart 需要一个值（例如：bash -s -- --restart 'systemctl restart x'）
+```
+
+（`--dir` / `--host` / `--advertise` / `--roles` / `--cacert` / `--endpoint` 同样处理。）
+
 ## [0.4.4-alpha] - 2026-11-03
 
 ### 修复：手动补参数的提示写错了语法
