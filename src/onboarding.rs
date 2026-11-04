@@ -459,9 +459,18 @@ mod tests {
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
         let script =
             render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
-        assert!(script.contains("身份材料必须落 ./identity/<peer>"));
+        assert!(script.contains("身份材料要落在 identity/ 下"));
         assert!(script.contains("WIST_CRED_ALLOW_UNSAFE_DIR=1"));
         assert!(script.contains("券还没用掉"));
+        // 管道进来的调用者没法“加个参数再跑”：必须给出**整条**可粘的命令。
+        assert!(
+            script.contains("curl -fsSLk '${ENROLL_URL}' | bash -s -- --dir"),
+            "报错里要带可直接重跑的完整命令"
+        );
+        assert!(
+            script.contains("suggest_identity_dir"),
+            "落点建议由栈里的实际目录决定，不能写死"
+        );
     }
 
     #[test]

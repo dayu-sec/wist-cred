@@ -244,7 +244,12 @@ async fn stack_root_refuses_outside_identity_and_keeps_the_ticket() {
     let out = Harness::run_script(&stack, &script, &[]);
     let text = stdout_of(&out);
     assert!(!out.status.success(), "栈里不带 --dir 必须失败：\n{text}");
-    assert!(text.contains("身份材料必须落 ./identity/<peer>"), "{text}");
+    assert!(text.contains("身份材料要落在 identity/ 下"), "{text}");
+    // 管道进来的调用者没法“加个参数再跑”：报错必须自带完整命令。
+    assert!(
+        text.contains("curl -fsSLk '") && text.contains("| bash -s -- --dir"),
+        "没给出可直接重跑的完整命令：\n{text}"
+    );
     assert!(
         !stack.join("wist-cred").exists(),
         "失败时不该创建任何目录：\n{text}"
@@ -257,6 +262,32 @@ async fn stack_root_refuses_outside_identity_and_keeps_the_ticket() {
     assert!(text.contains("▶ 完成"), "没走到最后：\n{text}");
     assert!(
         stack.join("identity/cred-client/cred.toml").is_file(),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stack_with_one_identity_dir_suggests_the_dir_its_consumer_expects() {
+    let harness = start("suggest").await;
+    let script = harness.fetch_script(&harness.dir.join("join.sh"));
+
+    // 栈里已经有一个服务身份目录（center-stack 的真实布局：identity/center）。
+    let stack = harness.dir.join("stack-suggest");
+    std::fs::create_dir_all(stack.join("identity/center")).expect("stack dirs");
+    std::fs::write(stack.join("sys-prj.yml"), "system: {}\n").expect("sys-prj");
+
+    let out = Harness::run_script(&stack, &script, &[]);
+    let text = stdout_of(&out);
+    assert!(!out.status.success(), "{text}");
+    // 建议 = 唯一子目录 + /cred，而不是写死的 ./identity/<peer>。
+    assert!(text.contains("--dir ./identity/center/cred"), "{text}");
+
+    // 把建议原样拿来重跑：券还在，必须跑通，且材料落在消费方会看的位置。
+    let out = Harness::run_script(&stack, &script, &["--dir", "./identity/center/cred"]);
+    let text = stdout_of(&out);
+    assert!(out.status.success(), "按建议重跑应当成功：\n{text}");
+    assert!(
+        stack.join("identity/center/cred/cred.toml").is_file(),
         "{text}"
     );
 }

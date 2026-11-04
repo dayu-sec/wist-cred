@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.14-alpha] - 2026-11-04
+
+### 修复：部署栈里的接入命令把人顶死了
+
+在部署栈（栈根有 `sys-prj.yml` + `identity/`）里直接粘页面给的命令，脚本会硬失败 ——
+护栏本身是对的（私钥不能进 `git status`），但报错只说「加 `--dir ./identity/<peer>` 重跑」，
+而**管道进来的调用者没法“加个参数再跑”**：整条 `curl … | bash -s -- …` 得自己拼回去。
+
+现在报错直接给**整条可粘的命令**，并且落点是按栈里的实际目录推的：
+
+- `identity/` 下**只有一个**子目录 → 建议 `./identity/<那个>/cred`
+  （正好是 `wist-center-stack` 的真实布局 `identity/center/cred`）；
+- 多个或没有 → 退回 `./identity/<peer>`，并注明以该栈 README 为准。
+
+仍然**不自动落盘**：猜错的话材料会放在消费方不看的地方，而那时券已经烧掉了。
+失败仍然发生在登记之前（券可重跑）。
+
+用例：单元 `stack_roots_refuse_identity_outside_identity_dir` 补了「必须带完整命令」；
+新增 e2e `a_stack_with_one_identity_dir_suggests_the_dir_its_consumer_expects`
+（造一个只有 `identity/center` 的栈 → 把报错里的建议原样重跑 → 必须成功且落在 `identity/center/cred/cred.toml`）。
+
 ## [0.4.13-alpha] - 2026-11-04
 
 ### 三轮 review 对 0.4.12 的补齐（同一条线，未发布就别留着）

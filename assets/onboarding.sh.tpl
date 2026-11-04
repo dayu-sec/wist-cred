@@ -72,7 +72,9 @@ usage() {
   -h, --help        显示本帮助
 
 不要求 root，只要求材料目录可写：容器栈部署就 cd 到栈根直接跑（材料落 ./wist-cred/<peer>），
-或用 --dir 指到栈里的目录（例如 --dir ./configs/wist-cred / --dir ./identity/cred-client）。
+或用 --dir 指到栈里的目录（例如 --dir ./identity/<peer>；具体看该栈的 README）。
+**在部署栈里（栈根有 sys-prj.yml 与 identity/）必须落 identity/ 下**，否则脚本会拒跑 ——
+但会把**完整可粘的命令**（带 --dir）打出来，券不会作废。
 **总是会生成 cred.toml**（与程序无关：只写 [identity] 与 [verify]），程序启动时
 加一行 `--credentials <cred.toml>` 指过来就行 —— 不需要改程序自己的配置。
 重复运行是安全的：已有私钥不覆盖，cred.toml 整份重写。
@@ -121,7 +123,25 @@ if [[ -z "$INSTALL_DIR" ]]; then
 fi
 # 部署栈里别把身份材料落在任意目录：栈根有 sys-prj.yml 时，身份要进 identity/
 # （contract + 备份），其它目录通常**不会被 .gitignore 挡住** —— 一份私钥躺在
-# `git status` 里就是一次事故。不拦（有人就是临时跑一下），但要当场说出来。
+# `git status` 里就是一次事故。
+#
+# 这里**硬失败**而不是猜一个目录：猜错了材料会落在消费方不看的地方，
+# 而券已经烧掉了（只能再开一张）。失败发生在登记之前，券还能重跑。
+suggest_identity_dir() {
+  local dirs=()
+  local entry
+  for entry in identity/*/; do
+    [[ -d "$entry" ]] || continue
+    dirs+=("$(basename "$entry")")
+  done
+  # 栈通常一个服务一个目录：只有一个就建议它（如 identity/center → ./identity/center/cred）。
+  if [[ ${#dirs[@]} -eq 1 ]]; then
+    printf './identity/%s/cred' "${dirs[0]}"
+  else
+    printf './identity/%s' "$PEER_NAME"
+  fi
+}
+
 if [[ -f sys-prj.yml && -d identity ]]; then
   case "$INSTALL_DIR" in
     ./identity/*|identity/*) ;;
@@ -130,9 +150,14 @@ if [[ -f sys-prj.yml && -d identity ]]; then
         say "⚠ 部署栈里把身份材料放在了 ${INSTALL_DIR}（已用 WIST_CRED_ALLOW_UNSAFE_DIR=1 放行）"
         say "  私钥会被 git 看到；identity/ 才进 contract/备份"
       else
-        die "这是部署栈：身份材料必须落 ./identity/<peer>（现在指向 ${INSTALL_DIR}）
-  处置：用同一条命令加 --dir ./identity/<peer> 重跑（券还没用掉）；
-        确实要放别处：WIST_CRED_ALLOW_UNSAFE_DIR=1 bash -s -- …"
+        SUGGESTED_DIR="$(suggest_identity_dir)"
+        die "这是部署栈：身份材料要落在 identity/ 下（现在指向 ${INSTALL_DIR}）
+
+  直接重跑（券还没用掉，整条粘过去就行）：
+      curl -fsSLk '${ENROLL_URL}' | bash -s -- --dir ${SUGGESTED_DIR}
+
+  该栈若规定了别的落点（例如 wist-center-stack 用 ./identity/center/cred），以它的 README 为准。
+  确实要放别处：WIST_CRED_ALLOW_UNSAFE_DIR=1 bash -s -- --dir ${INSTALL_DIR}"
       fi
       ;;
   esac
