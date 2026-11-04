@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.9-alpha] - 2026-11-03
+
+### 新增：部署栈里的落点警告
+
+`./wist-cred/<peer>` 只是脚本给非 root 用的默认值，不是约定。在部署栈里（栈根有
+`sys-prj.yml` + `identity/`）它**不被 `.gitignore` 挡住** —— 一行 `git status` 就能看到 `server.key`。
+
+现在脚本会当场提醒：
+
+```
+⚠ 当前目录是一个部署栈：身份材料建议用 --dir ./identity/<peer>
+  （identity/ 进 contract/备份且被 .gitignore 挡住；其它目录里的私钥会被 git 看到）
+```
+
+不拦：临时跑一次也合理；但得让人知道 `identity/` 才是它的位置。
+
 ## [0.4.8-alpha] - 2026-11-03
 
 ### 修复：`$VAR` 紧跟全角标点 → bash 把它吃进变量名

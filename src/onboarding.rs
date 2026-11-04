@@ -436,6 +436,18 @@ mod tests {
     }
 
     #[test]
+    fn stack_roots_get_a_warning_about_identity_location() {
+        // 部署栈里身份材料要进 identity/（contract/备份 + .gitignore）；
+        // 落在 ./wist-cred/<peer> 时私钥会出现在 `git status` 里。
+        let peer = peer_for("wist-center", &[]);
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
+        assert!(script.contains("当前目录是一个部署栈：身份材料建议用 --dir ./identity/<peer>"));
+        assert!(script.contains("私钥会被 git 看到"));
+    }
+
+    #[test]
     fn script_never_puts_a_bare_variable_next_to_wide_characters() {
         // bash 在 UTF-8 locale 下会把紧跟的**多字节字符**当成变量名的一部分：
         // `say "（$CRED_FILE）"` 会被解成 `$CRED_FILE（` → unbound variable。

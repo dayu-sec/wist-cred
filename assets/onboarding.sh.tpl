@@ -104,6 +104,18 @@ if [[ -z "$INSTALL_DIR" ]]; then
     INSTALL_DIR="./wist-cred/$PEER_NAME"
   fi
 fi
+# 部署栈里别把身份材料落在任意目录：栈根有 sys-prj.yml 时，身份要进 identity/
+# （contract + 备份），其它目录通常**不会被 .gitignore 挡住** —— 一份私钥躺在
+# `git status` 里就是一次事故。不拦（有人就是临时跑一下），但要当场说出来。
+if [[ -f sys-prj.yml && -d identity ]]; then
+  case "$INSTALL_DIR" in
+    ./identity/*|identity/*) ;;
+    *)
+      say "⚠ 当前目录是一个部署栈：身份材料建议用 --dir ./identity/<peer>"
+      say "  （identity/ 进 contract/备份且被 .gitignore 挡住；其它目录里的私钥会被 git 看到）"
+      ;;
+  esac
+fi
 if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
   die "建不了材料目录：${INSTALL_DIR}（非 root 默认落 ./wist-cred/${PEER_NAME}；要写 /etc 请用 root 跑，或用 --dir 指到可写目录）"
 fi
