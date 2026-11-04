@@ -436,6 +436,21 @@ mod tests {
     }
 
     #[test]
+    fn script_exits_non_zero_when_it_aborts_midway() {
+        // bash 3.2 在 EXIT trap 存在时会把脚本中断（如 `set -u` 展开失败）记成退出码 0。
+        // 必须靠显式“跑完了”标记兜底；而且 trap / cleanup **只能有一个** ——
+        // 重复定义会让后一个覆盖前一个，兜底静默失效（本次 review 真踩到过）。
+        let peer = peer_for("wist-center", &[]);
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
+        assert_eq!(script.matches("trap cleanup EXIT").count(), 1, "trap 重复");
+        assert_eq!(script.matches("cleanup() {").count(), 1, "cleanup 重复");
+        assert!(script.contains("finished=0"));
+        assert!(script.contains("finished=1"));
+    }
+
+    #[test]
     fn stack_roots_refuse_identity_outside_identity_dir() {
         // 部署栈里身份材料要进 identity/（contract/备份 + .gitignore）；
         // 落在 ./wist-cred/<peer> 时私钥直接出现在 `git status` 里 —— 现场真发生过。

@@ -1,6 +1,6 @@
 [package]
 name = "wist-cred"
-version = "0.4.10" #@gxl:set(version)
+version = "0.4.11" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["wist Dev Team"]
@@ -46,6 +46,9 @@ tower = { version = "0.5", features = ["util"] }
 # 验证侧的真实实作（闭环测试要拿它验，不是一个 mock）。
 # 同一个 path：features 相加不冲突（runtime 不带 credential，测试才带）。
 wist-auth = { path = "../wist-auth", default-features = false, features = ["credential"] }
+# 端到端要一个**真的签发 CA**（测试里现场生成，不落仓库）。与运行期同一个源，
+# 否则 cargo 会报「same crate, different source paths」。
+wist-pki = "0.1.2"
 # 示例验证方依赖**已发布**的 `wist-cred-peer`（不引本地 path）：它就是“下游怎么接”的样板。
 # 它只用于 example / 镜像 `wist-cred-example`，不进服务二进制。
 # 0.2：支持授权记录验签（`--issuer-public-key`）。

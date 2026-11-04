@@ -39,7 +39,22 @@ CA_CERT=""
 
 say()  { printf '  %s\n' "$*"; }
 step() { printf '\n▶ %s\n' "$*"; }
-die()  { printf '\n✗ %s\n' "$*" >&2; exit 1; }
+die()  { finished=1; printf '\n✗ %s\n' "$*" >&2; exit 1; }
+
+# 退出清理 + **状态兜底**。
+# bash 3.2（macOS 自带）在 EXIT trap 存在时，会把 `set -u` 展开失败这类中断记成退出码 0
+#（连 trap 里的 `$?` 都是 0）。表现：错误打了、文件写了一半、`bash join.sh` 却返回成功，
+# 自动化会误判。所以用显式的“跑完了”标记：只有走到最后 / 显式 `die` / `--help` 才允许 0。
+finished=0
+cleanup() {
+  local rc=$?
+  rm -f "${tmp_body:-}"
+  if [[ $rc -eq 0 && ${finished:-0} != 1 ]]; then
+    rc=1
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
 
 usage() {
   cat <<'USAGE'
@@ -85,7 +100,7 @@ while [[ $# -gt 0 ]]; do
     --host)     [[ $# -ge 2 ]] || die "--host 需要一个值（证书 SAN）";      PEER_HOST="$2"; shift 2 ;;
     --advertise) [[ $# -ge 2 ]] || die "--advertise 需要一个值（收数地址）"; PEER_ENDPOINT="$2"; shift 2 ;;
     --roles)    [[ $# -ge 2 ]] || die "--roles 需要一个值（逗号分隔，如 admin,read）";     PEER_ROLES="$2"; shift 2 ;;
-    -h|--help)  usage; exit 0 ;;
+    -h|--help)  usage; finished=1; exit 0 ;;
     *)          die "未知参数：${1}（-h 看用法）" ;;
   esac
 done
@@ -210,7 +225,6 @@ else
 fi
 
 tmp_body="$(mktemp)"
-trap 'rm -f "$tmp_body"' EXIT
 
 # CSR 里会有换行与引号：按 JSON 字符串转义后再拼进请求体。
 csr_escaped="$(awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s\\n", $0 }' "$CSR")"
@@ -301,3 +315,4 @@ step "完成"
 say "cred 来调你 → 出示 CA-I 签发的客户端证书（CN=wist-cred），你用 client-ca.pem 验它"
 say "你的服务器证书由签发方按本机 CSR 签出（CN/SAN=${PEER_HOST}），私钥从未离开本机"
 say "材料目录：${INSTALL_DIR}"
+finished=1

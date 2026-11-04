@@ -1,0 +1,293 @@
+//! 端到端：把签发出来的 `join.sh` **真的用 bash 跑一遍**。
+//!
+//! 为什么不用“渲染文本断言”：我们连撞过几个只有运行时才暴露的错 ——
+//!   · `$CRED_FILE（`：bash 把全角括号当成变量名的一部分（unbound variable）；
+//!   · 在部署栈里把身份材料落到 `./wist-cred/<peer>`（私钥出现在 `git status`）；
+//!   · `--config` 指到目录 / 与材料不同目录。
+//! 文本断言一个都抓不到。这里起一个真 cred（axum + 真实 CA），用 `curl` 取脚本、
+//! 用 `bash` 执行，然后看磁盘上留下了什么。
+//!
+//! 运行时依赖：`bash` / `curl` / `openssl` —— 与脚本自身的硬前置一致。
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use wist_cred::api::{self, AppState};
+use wist_cred::config::{
+    AuthMode, Config, IssueConfig, OnboardingConfig, ServerConfig, StorageConfig,
+};
+use wist_cred::onboarding::TicketStore;
+use wist_cred::peers::{NewPeer, PeerRegistry};
+use wist_cred::store::Store;
+use wist_pki::CertificateAuthority;
+
+const OPERATOR_HEADER: &str = "x-wist-operator";
+
+struct Harness {
+    addr: SocketAddr,
+    dir: PathBuf,
+    boarding: Arc<TicketStore>,
+}
+
+fn unique_dir(tag: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("wist-cred-e2e-{tag}-{nanos}"));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
+/// 起一个真 cred：真实 CA（测试里现场生成）、一个已登记的认证系统。
+async fn start(tag: &str) -> Harness {
+    let dir = unique_dir(tag);
+
+    // CA-S：签发 X 的服务器证书。同一张证书也当 CA-I 的信任锚下发（测试里够用）。
+    let (authority, ca_cert_pem, ca_key_pem) =
+        CertificateAuthority::generate("WistCred E2E CA").expect("generate CA");
+    let ca_cert = dir.join("ca.crt");
+    let ca_key = dir.join("ca.key");
+    std::fs::write(&ca_cert, ca_cert_pem).expect("write ca cert");
+    std::fs::write(&ca_key, ca_key_pem).expect("write ca key");
+
+    let config = Config {
+        server: ServerConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            mode: AuthMode::Ingress,
+            ingress_header: OPERATOR_HEADER.to_string(),
+            admin_password_hash: String::new(),
+            trusted_peers: vec!["127.0.0.1/32".to_string()],
+            // 故意不配：走 Host 头推（curl 会带端口），顺便钉住这条路径。
+            public_base_url: None,
+        },
+        storage: StorageConfig {
+            path: dir.join("credentials.db"),
+        },
+        issue: IssueConfig {
+            digest: "sha256".to_string(),
+            max_ttl_seconds: 2_592_000,
+            break_glass_max_ttl_seconds: 7_776_000,
+            overlap_seconds: 300,
+            // 不配签发钥：顺便覆盖“没公钥就不写 require_signature”的分支。
+            signing_key: None,
+        },
+        push: None,
+        onboarding: OnboardingConfig {
+            dir: None,
+            store_path: dir.join("peers.json"),
+            script_ttl_seconds: 900,
+            ca_cert: Some(ca_cert.clone()),
+            ca_key: Some(ca_key.clone()),
+            client_ca: Some(ca_cert),
+            peer_cert_ttl_seconds: 7_776_000,
+            heartbeat_seconds: 0,
+        },
+    };
+
+    let peers = Arc::new(PeerRegistry::open(config.onboarding.store_path.clone()).expect("peers"));
+    peers
+        .create(
+            NewPeer {
+                name: "wist-center".to_string(),
+                host: Some("center.internal".to_string()),
+                endpoint: None,
+                healthz: None,
+                roles: vec!["admin".to_string(), "read".to_string()],
+                config_path: None,
+                restart_cmd: None,
+            },
+            "e2e",
+        )
+        .expect("create peer");
+
+    let boarding = Arc::new(TicketStore::new(config.onboarding.script_ttl_seconds));
+    let state = AppState {
+        config: Arc::new(config),
+        store: Arc::new(Store::open(dir.join("credentials.db")).expect("store")),
+        push: None,
+        boarding: boarding.clone(),
+        signer: Some(Arc::new(authority)),
+        peers,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        // 必须带 connect info：处理函数要从 `ConnectInfo<SocketAddr>` 取对端 IP 做 peer 白名单。
+        let service = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
+        let _ = axum::serve(listener, service).await;
+    });
+
+    Harness {
+        addr,
+        dir,
+        boarding,
+    }
+}
+
+impl Harness {
+    /// 真的走一遍 `curl … -o join.sh`：连路由一起测。
+    fn fetch_script(&self, into: &Path) -> PathBuf {
+        let (token, _ttl) = self.boarding.mint("wist-center");
+        let url = format!("http://{}/enroll/{token}/join.sh", self.addr);
+        let out = Command::new("curl")
+            .args(["-fsSL", &url, "-o"])
+            .arg(into)
+            .output()
+            .expect("run curl");
+        assert!(
+            out.status.success(),
+            "取脚本失败：{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        into.to_path_buf()
+    }
+
+    fn run_script(cwd: &Path, script: &Path, args: &[&str]) -> Output {
+        let mut command = Command::new("bash");
+        command.arg(script).args(args).current_dir(cwd);
+        // 固定成 UTF-8 locale：`$VAR（` 这类错**只在 UTTF-8 locale 下复现**
+        // （bash 会把多字节字符当成变量名的一部分）。C locale 下测试会假绿。
+        if let Some(locale) = utf8_locale() {
+            command.env("LC_ALL", &locale).env("LANG", &locale);
+        }
+        command.output().expect("run join.sh")
+    }
+}
+
+/// 本机能用的 UTF-8 locale（优先 en_US，再 C）。
+fn utf8_locale() -> Option<String> {
+    let out = Command::new("locale").arg("-a").output().ok()?;
+    let listing = String::from_utf8_lossy(&out.stdout);
+    for want in ["en_US.UTF-8", "en_US.utf8", "C.UTF-8", "C.utf8"] {
+        if listing.lines().any(|line| line.trim() == want) {
+            return Some(want.to_string());
+        }
+    }
+    None
+}
+
+fn stdout_of(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn happy_path_writes_materials_and_cred_toml() {
+    let harness = start("happy").await;
+    let script = harness.fetch_script(&harness.dir.join("join.sh"));
+    let material_dir = harness.dir.join("identity/cred-client");
+
+    let out = Harness::run_script(
+        &harness.dir,
+        &script,
+        &["--dir", material_dir.to_str().unwrap()],
+    );
+    let text = stdout_of(&out);
+    assert!(out.status.success(), "脚本应当成功：\n{text}");
+    assert!(
+        text.contains("▶ 完成"),
+        "脚本没走到最后（中途退出了）：\n{text}"
+    );
+
+    for name in ["server.crt", "server.key", "client-ca.pem", "cred.toml"] {
+        assert!(
+            material_dir.join(name).is_file(),
+            "{name} 没落盘；输出：\n{text}"
+        );
+    }
+
+    let cred_toml = std::fs::read_to_string(material_dir.join("cred.toml")).expect("cred.toml");
+    assert!(cred_toml.contains("[identity]"), "{cred_toml}");
+    assert!(
+        cred_toml.contains("cert      = \"server.crt\""),
+        "{cred_toml}"
+    );
+    // 本测试没配签发钥 ⇒ 不能开验签（开了就会拿不存在的文件去验）。
+    assert!(
+        !cred_toml
+            .lines()
+            .any(|line| line == "require_signature = true"),
+        "没下发公钥却开了验签：\n{cred_toml}"
+    );
+    assert!(
+        cred_toml.contains("# require_signature = true"),
+        "{cred_toml}"
+    );
+    // 上报了角色就写进文件。
+    assert!(
+        cred_toml.contains("roles = [\"admin\", \"read\"]"),
+        "{cred_toml}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stack_root_refuses_outside_identity_and_keeps_the_ticket() {
+    let harness = start("stack").await;
+    let script = harness.fetch_script(&harness.dir.join("join.sh"));
+
+    // 造一个“部署栈”的现场：栈根有 sys-prj.yml + identity/。
+    let stack = harness.dir.join("stack");
+    std::fs::create_dir_all(stack.join("identity")).expect("stack dirs");
+    std::fs::write(stack.join("sys-prj.yml"), "system: {}\n").expect("sys-prj");
+
+    let out = Harness::run_script(&stack, &script, &[]);
+    let text = stdout_of(&out);
+    assert!(!out.status.success(), "栈里不带 --dir 必须失败：\n{text}");
+    assert!(text.contains("身份材料必须落 ./identity/<peer>"), "{text}");
+    assert!(
+        !stack.join("wist-cred").exists(),
+        "失败时不该创建任何目录：\n{text}"
+    );
+
+    // 关键：券没被烧掉 —— 同一条命令加 --dir 还能跑通。
+    let out = Harness::run_script(&stack, &script, &["--dir", "./identity/cred-client"]);
+    let text = stdout_of(&out);
+    assert!(out.status.success(), "补上 --dir 应当成功：\n{text}");
+    assert!(text.contains("▶ 完成"), "没走到最后：\n{text}");
+    assert!(
+        stack.join("identity/cred-client/cred.toml").is_file(),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_outside_the_material_dir_is_refused() {
+    let harness = start("config").await;
+    let script = harness.fetch_script(&harness.dir.join("join.sh"));
+
+    let material = harness.dir.join("materials");
+    let elsewhere = harness.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+
+    let out = Harness::run_script(
+        &harness.dir,
+        &script,
+        &[
+            "--dir",
+            material.to_str().unwrap(),
+            "--config",
+            elsewhere.join("cred.toml").to_str().unwrap(),
+        ],
+    );
+    let text = stdout_of(&out);
+    assert!(
+        !out.status.success(),
+        "跨目录写 cred.toml 必须失败：\n{text}"
+    );
+    assert!(text.contains("必须与材料同目录"), "{text}");
+    assert!(
+        !elsewhere.join("cred.toml").exists(),
+        "失败时不该写任何文件"
+    );
+}

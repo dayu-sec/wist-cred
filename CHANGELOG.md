@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.4.11-alpha] - 2026-11-03
+
+### 新增：真正跑脚本的端到端测试（`tests/onboarding_e2e.rs`）
+
+之前所有测试都只断言“渲染出来的文本”，于是运行时才有问题的那一类全部漏掉：
+`$VAR（` 被 bash 吃成变量名、在部署栈里落错目录、中途崩了却返回成功。
+
+现在起一个真 cred（真 CA + axum），用 `curl` 取脚本、用 `bash` 执行，看磁盘上留下了什么：
+
+- `happy_path_writes_materials_and_cred_toml`：材料 + `cred.toml` 落盘，内容对；
+- `stack_root_refuses_outside_identity_and_keeps_the_ticket`：栈里不带 `--dir` 拒绝，
+  而且**券还能重跑**（失败发生在登记之前）；
+- `config_outside_the_material_dir_is_refused`：跨目录写 `cred.toml` 拒绝。
+
+测试里固定 `LC_ALL=en_US.UTF-8` —— 那个 `$VAR（` 的坑**只在 UTF-8 locale 下复现**，
+C locale 会假绿（已做变异验证：改回 `$CRED_FILE）` 三个用例全红）。
+
+### 修复：脚本中途失败却返回退出码 0
+
+bash 3.2（macOS 自带）在存在 `EXIT` trap 时，会把 `set -u` 展开失败这类中断记成 **0**（
+连 trap 里的 `$?` 都是 0）。表现：错误打了、文件写了一半、`bash join.sh` 却“成功”。
+
+现在用显式的“跑完了”标记兜底：只有走到最后 / 显式 `die` / `--help` 才允许 0，
+否则一律非零。另新增一条单测钉住 **`cleanup` / `trap` 只能各一个**
+（重复定义会让后一个覆盖前一个，兜底静默失效）。
+
 ## [0.4.10-alpha] - 2026-11-03
 
 ### 变更：部署栈里把身份落点改成**硬失败**
