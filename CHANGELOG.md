@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.8-alpha] - 2026-11-03
+
+### 修复：`$VAR` 紧跟全角标点 → bash 把它吃进变量名
+
+现场跑到 `cred.toml ✓（…）` 时：
+
+```
+bash: line 305: CRED_FILE（: unbound variable
+```
+
+原因：`set -u` + UTF-8 locale 下，bash 把 `$CRED_FILE（` 里的全角括号当成了变量名的一部分。
+已把两处改成 `${VAR}`：
+
+- `say "cred.toml ✓（${CRED_FILE}）"`
+- `die "未知参数：${1}（-h 看用法）"`
+
+### 测试
+
+新增 `script_never_puts_a_bare_variable_next_to_wide_characters`：扫渲染结果里每个 `$`，
+只要变量名后面紧跟非 ASCII 字符就失败 —— 这类错 shellcheck 不会报，只能靠这条钉住。
+
 ## [0.4.7-alpha] - 2026-11-03
 
 ### 修复：cred.toml 的三个真问题（review 第一/二遍）

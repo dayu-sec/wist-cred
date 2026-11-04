@@ -86,7 +86,7 @@ while [[ $# -gt 0 ]]; do
     --advertise) [[ $# -ge 2 ]] || die "--advertise 需要一个值（收数地址）"; PEER_ENDPOINT="$2"; shift 2 ;;
     --roles)    [[ $# -ge 2 ]] || die "--roles 需要一个值（逗号分隔，如 admin,read）";     PEER_ROLES="$2"; shift 2 ;;
     -h|--help)  usage; exit 0 ;;
-    *)          die "未知参数：$1（-h 看用法）" ;;
+    *)          die "未知参数：${1}（-h 看用法）" ;;
   esac
 done
 
@@ -263,7 +263,7 @@ cat >"$CRED_FILE" <<'WIST_CRED_TOML'
 __CRED_TOML__
 WIST_CRED_TOML
 chmod 0644 "$CRED_FILE"
-say "cred.toml ✓（$CRED_FILE）"
+say "cred.toml ✓（${CRED_FILE}）"
 
 step "接入文件（与程序无关，程序只需指过来）"
 cat "$CRED_FILE"

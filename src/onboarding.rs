@@ -436,6 +436,42 @@ mod tests {
     }
 
     #[test]
+    fn script_never_puts_a_bare_variable_next_to_wide_characters() {
+        // bash 在 UTF-8 locale 下会把紧跟的**多字节字符**当成变量名的一部分：
+        // `say "（$CRED_FILE）"` 会被解成 `$CRED_FILE（` → unbound variable。
+        // 所以变量后面接中文/全角标点时一律写 `${VAR}`。
+        let peer = peer_for("wist-center", &["admin"]);
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script = render_script(
+            &peer,
+            ca,
+            "https://cred.internal/x",
+            Some(&"ab".repeat(32)),
+            None,
+            None,
+        )
+        .expect("render");
+
+        for (idx, _) in script.match_indices('$') {
+            let rest = &script[idx + 1..];
+            let name_len = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .count();
+            if name_len == 0 || rest.starts_with('{') {
+                continue;
+            }
+            if let Some(next) = rest[name_len..].chars().next() {
+                assert!(
+                    next.is_ascii(),
+                    "变量后面紧跟宽字符（会被 bash 吃进变量名）：…{} …",
+                    &script[idx..(idx + 1 + name_len + next.len_utf8())]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cred_toml_only_requires_signature_when_the_key_is_shipped() {
         // 没下发签名公钥却写 `require_signature = true`，验证方会拿一个不存在的文件验签，
         // 结果拒绝一切 —— 比“不验”更难查。所以这两行必须跟着公钥一起出现。
