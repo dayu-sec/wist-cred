@@ -498,6 +498,50 @@ impl PeerRegistry {
         Ok(updated)
     }
 
+    /// 应用部署栈声明的「认证系统 → 材料目录」（`onboarding.peer_dirs`）。
+    ///
+    /// 规则：
+    /// - **只补空**：页面上已经存过的值优先（人可能更清楚，且页面上改过的不该被重启改回去）；
+    /// - 声明了一个还不存在的认证系统：跳过 + 告警（它可能是靠页面新建的，还没建）；
+    /// - 值不一致：告警，以现有值为准。
+    ///
+    /// 返回实际写入的系统名（给启动日志用）。
+    pub fn seed_install_dirs(&self, dirs: &[(String, String)]) -> anyhow::Result<Vec<String>> {
+        if dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut state = self.lock();
+        let before = (state.revision, state.peers.clone());
+        let mut applied = Vec::new();
+        for (name, dir) in dirs {
+            let Some(peer) = state.peers.get_mut(name) else {
+                log::warn!("peer_dirs declares {name:?}, but no such auth system is registered");
+                continue;
+            };
+            match &peer.install_dir {
+                Some(existing) if existing == dir => {}
+                Some(existing) => log::warn!(
+                    "peer_dirs declares {name:?} -> {dir:?}, but it already uses {existing:?}; keeping the existing value"
+                ),
+                None => {
+                    peer.install_dir = Some(dir.clone());
+                    applied.push(name.clone());
+                }
+            }
+        }
+        if applied.is_empty() {
+            return Ok(applied);
+        }
+        state.revision += 1;
+        let snapshot = snapshot(&state);
+        if let Err(error) = write(&self.path, &snapshot) {
+            state.revision = before.0;
+            state.peers = before.1;
+            return Err(error);
+        }
+        Ok(applied)
+    }
+
     /// 改“接入落点”：接入脚本要不要顺手写配置、写完要不要重启。
     ///
     /// 与 `set_endpoint` 同一套落盘 / 回滚；这里**不动健康结论** —— 它不改变可达性。
@@ -1637,6 +1681,67 @@ mod tests {
         assert_eq!(
             registry.get("wist-center").unwrap().endpoint.as_deref(),
             Some("https://center.internal:3103/api/v1/internal/credentials")
+        );
+    }
+
+    // ── 部署栈声明的材料目录（`CRED_PEER_DIRS`）──
+
+    #[test]
+    fn declared_peer_dirs_fill_only_the_empty_slot() {
+        let dir = TempDir::new();
+        let reg = registry(&dir);
+        reg.create(new_peer("wist-center"), "alice").unwrap();
+        reg.create(new_peer("wist-ingest"), "alice").unwrap();
+        // 人已经在页面上选过的那个不许被重启改回去。
+        reg.set_setup("wist-ingest", Some("./picked/by/human"), None, None)
+            .unwrap();
+
+        let applied = reg
+            .seed_install_dirs(&[
+                (
+                    "wist-center".to_string(),
+                    "./identity/center/cred".to_string(),
+                ),
+                ("wist-ingest".to_string(), "./other".to_string()),
+                // 还没注册的系统：跳过，不拦住启动。
+                ("ghost".to_string(), "./ghost".to_string()),
+            ])
+            .expect("seed");
+
+        assert_eq!(applied, vec!["wist-center".to_string()]);
+        assert_eq!(
+            reg.get("wist-center").unwrap().install_dir.as_deref(),
+            Some("./identity/center/cred")
+        );
+        assert_eq!(
+            reg.get("wist-ingest").unwrap().install_dir.as_deref(),
+            Some("./picked/by/human"),
+            "页面上存过的优先"
+        );
+        // 落盘了：重启不再需要重新声明。
+        assert_eq!(
+            registry(&dir)
+                .get("wist-center")
+                .unwrap()
+                .install_dir
+                .as_deref(),
+            Some("./identity/center/cred")
+        );
+    }
+
+    #[test]
+    fn seeding_the_same_value_again_is_a_no_op() {
+        let dir = TempDir::new();
+        let reg = registry(&dir);
+        reg.create(new_peer("wist-center"), "alice").unwrap();
+        let decl = vec![(
+            "wist-center".to_string(),
+            "./identity/center/cred".to_string(),
+        )];
+        assert_eq!(reg.seed_install_dirs(&decl).unwrap().len(), 1);
+        assert!(
+            reg.seed_install_dirs(&decl).unwrap().is_empty(),
+            "第二次不应再算作写入（否则每次重启都 bump revision）"
         );
     }
 }

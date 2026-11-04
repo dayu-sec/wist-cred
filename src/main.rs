@@ -39,6 +39,14 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => log::warn!("peer import from {} failed: {error:#}", dir.display()),
         }
     }
+    // 部署栈声明的材料目录（`CRED_PEER_DIRS`）：接入命令据此预填 `--dir`。
+    match peers.seed_install_dirs(&config.onboarding.peer_dirs) {
+        Ok(applied) if !applied.is_empty() => {
+            log::info!("material dir seeded for: {}", applied.join(", "));
+        }
+        Ok(_) => {}
+        Err(error) => log::warn!("seeding material dirs failed: {error:#}"),
+    }
 
     let boarding = wist_cred::onboarding::TicketStore::new(config.onboarding.script_ttl_seconds);
 

@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.4.16-alpha] - 2026-11-04
+
+### 新增：部署栈可以声明「认证系统 → 材料目录」（`peer_dirs`）
+
+上一版把落点做成了认证系统的属性，但**初始值还是要人填**，而且静态预置里我写的
+`./identity/<peer>/cred` 对某些栈是错的（`wist-center-stack` 用的是 `identity/center/cred`，
+服务目录名和 peer 名对不上）。猜不出来，只能拦 —— 而拦一次就烧一张券。
+
+现在由**部署栈自己声明**（`wist-cred-stack` 的 `CRED_PEER_DIRS` →
+`[onboarding] peer_dirs = "name=目录,name=目录"`），cred 启动时写进注册表：
+
+- **只补空**：页面上存过的优先（人可能更清楚，且重启不应该改回去）；
+- 声明了还没注册的系统：告警 + 跳过，不拦启动；
+- 值不一致：告警，保留现有值；
+- **加载期校验格式**：忘写 `=目录` / 名字为空 / 重复 / 带控制字符 → 启动就报，
+  而不是变成一条“没生效的声明”。
+
+写法：用逗号分隔的字符串而不是 TOML 数组 —— 这个值要穿过栈的模板变量，
+数组得把引号也塞进模板，模板引擎一转义就坏了。
+
+用例：`peer_dirs_are_parsed_into_pairs`、`a_malformed_peer_dir_fails_at_load_time`、
+`a_peer_dir_with_control_characters_is_rejected`、`listing_the_same_auth_system_twice_is_rejected`、
+`declared_peer_dirs_fill_only_the_empty_slot`（含未注册系统跳过 + 落盘）、
+`seeding_the_same_value_again_is_a_no_op`（不重复 bump revision）。
+
+> 升级注意：`[onboarding]` 是 `deny_unknown_fields` 的 —— 新版模板 + 旧版镜像会拒启，
+> 两者必须一起升（栈 0.4.16 钉的就是本版）。
+
 ## [0.4.15-alpha] - 2026-11-04
 
 ### 新增：材料目录成了认证系统的属性（`install_dir`）

@@ -1638,6 +1638,7 @@ mod tests {
                     client_ca: None,
                     peer_cert_ttl_seconds: 7_776_000,
                     heartbeat_seconds: 30,
+                    peer_dirs: Vec::new(),
                 },
             };
             let store = Store::open(config.storage.path.clone()).expect("open store");

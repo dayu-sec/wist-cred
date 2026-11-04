@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         push: None,
         onboarding: OnboardingConfig {
             dir: None,
+            peer_dirs: Vec::new(),
             store_path: dir.join("peers.json"),
             script_ttl_seconds: 900,
             ca_cert: None,

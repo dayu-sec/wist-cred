@@ -218,6 +218,15 @@ pub struct OnboardingConfig {
     pub peer_cert_ttl_seconds: u64,
     /// 心跳间隔；`0` = 关闭心跳（页面会一直显示"未知"）。
     pub heartbeat_seconds: u64,
+    /// 部署栈声明的「认证系统 → 材料目录」。
+    ///
+    /// 为什么由栈声明而不是靠人填：接入脚本在**对方的栈**里跑，而落点取决于那个栈的
+    /// 目录布局（如 `wist-center-stack` 是 `identity/center/cred`，不是 `identity/<peer>`）。
+    /// 猜不出来，只能拦（护栏）—— 拦一次就烧一张券。让部署方在 `values` 里写一遍，
+    /// 启动时填进注册表，页面生成的接入命令就自带 `--dir`。
+    ///
+    /// **只补空**：页面上已经存过的值优先（人可能更清楚）。
+    pub peer_dirs: Vec<(String, String)>,
 }
 
 impl Config {
@@ -424,6 +433,12 @@ struct RawOnboarding {
     peer_cert_ttl_seconds: u64,
     #[serde(default = "default_heartbeat")]
     heartbeat_seconds: u64,
+    /// `"wist-center=./identity/center/cred,wist-ingest=..."`（与 `CRED_PKI_PEERS` 同一种写法）。
+    ///
+    /// 用字符串而不是 TOML 数组：这个值由栈的模板变量直接展开（`CRED_PEER_DIRS`），
+    /// 数组要把引号也塞进模板，模板引擎一转义就坏了。逗号分隔在两侧都稳。
+    #[serde(default)]
+    peer_dirs: String,
 }
 
 impl Default for RawOnboarding {
@@ -437,8 +452,37 @@ impl Default for RawOnboarding {
             client_ca: None,
             peer_cert_ttl_seconds: default_peer_cert_ttl(),
             heartbeat_seconds: default_heartbeat(),
+            peer_dirs: String::new(),
         }
     }
+}
+
+/// `"name=dir,name=dir"` → `[(name, dir)]`。在**加载期**就把格式错误爆出来：
+/// 写成 `"wist-center"`（忘了 `=目录`）在启动后就只是一条“没生效的声明”，很难查。
+fn parse_peer_dirs(raw: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some((name, dir)) = item.split_once('=') else {
+            bail!("onboarding.peer_dirs entry {item:?} must look like \"<auth system>=<dir>\"");
+        };
+        let name = name.trim();
+        let dir = dir.trim();
+        if name.is_empty() || dir.is_empty() {
+            bail!("onboarding.peer_dirs entry {item:?} must have both a name and a dir");
+        }
+        if dir.chars().any(char::is_control) {
+            bail!("onboarding.peer_dirs entry {item:?} must not contain control characters");
+        }
+        if out.iter().any(|(existing, _)| existing == name) {
+            bail!("onboarding.peer_dirs lists {name:?} twice");
+        }
+        out.push((name.to_string(), dir.to_string()));
+    }
+    Ok(out)
 }
 
 fn default_listen() -> String {
@@ -648,6 +692,7 @@ impl RawConfig {
             Some(path) => Some(path_of(path)?),
             None => None,
         };
+        let peer_dirs = parse_peer_dirs(&self.onboarding.peer_dirs)?;
         let client_ca = match &self.onboarding.client_ca {
             Some(path) => Some(path_of(path)?),
             None => None,
@@ -696,6 +741,7 @@ impl RawConfig {
                 client_ca,
                 peer_cert_ttl_seconds: self.onboarding.peer_cert_ttl_seconds,
                 heartbeat_seconds: self.onboarding.heartbeat_seconds,
+                peer_dirs,
             },
         })
     }
@@ -939,6 +985,54 @@ mod tests {
             err.to_string().contains("not implemented"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn peer_dirs_are_parsed_into_pairs() {
+        let text = format!(
+            "{MINIMAL}\n[onboarding]\npeer_dirs = \"wist-center=./identity/center/cred, wist-ingest = ./identity/ingest/cred \"\n"
+        );
+        let config = parse(&text).expect("parse");
+        assert_eq!(
+            config.onboarding.peer_dirs,
+            vec![
+                (
+                    "wist-center".to_string(),
+                    "./identity/center/cred".to_string()
+                ),
+                (
+                    "wist-ingest".to_string(),
+                    "./identity/ingest/cred".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_peer_dir_fails_at_load_time() {
+        // 写成“忘了 =目录”在启动后只是一条没生效的声明，很难查 —— 必须在加载期就爆。
+        for bad in ["wist-center", "wist-center=", "=./identity/center/cred"] {
+            let text = format!("{MINIMAL}\n[onboarding]\npeer_dirs = \"{bad}\"\n");
+            let err = parse(&text).expect_err(bad);
+            assert!(
+                err.to_string().contains("peer_dirs"),
+                "{bad}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_dir_with_control_characters_is_rejected() {
+        // 目录会直接进配置渲染和接入命令；换行会把后面的内容变成别的东西。
+        let err = parse_peer_dirs("wist-center=./a\nb").expect_err("newline");
+        assert!(err.to_string().contains("control"), "{err}");
+    }
+
+    #[test]
+    fn listing_the_same_auth_system_twice_is_rejected() {
+        let text = format!("{MINIMAL}\n[onboarding]\npeer_dirs = \"a=./x, a=./y\"\n");
+        let err = parse(&text).expect_err("duplicate");
+        assert!(err.to_string().contains("twice"), "unexpected error: {err}");
     }
 
     #[test]
