@@ -3159,6 +3159,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_endpoint_posted_without_a_path_comes_back_normalized() {
+        // 页面上最容易出现的填法：只给 origin。存进去的必须是能推送的完整地址，
+        // 否则它会「探活绿、推送 404」—— 之前就是这样把人坑住的。
+        let harness = Harness::new().with_peer("wist-center", "center.internal");
+        let (status, body) = harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-center/endpoint",
+                Some("alice"),
+                "127.0.0.1",
+                Some(json!({ "endpoint": "https://center.internal:3103" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["endpoint"],
+            "https://center.internal:3103/api/v1/internal/credentials"
+        );
+        assert_eq!(body["probe_url"], "https://center.internal:3103/healthz");
+    }
+
+    #[tokio::test]
     async fn setting_an_endpoint_on_an_unknown_peer_is_404() {
         let harness = Harness::new();
         let (status, _) = harness

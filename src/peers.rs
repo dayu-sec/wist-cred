@@ -80,6 +80,13 @@ impl Peer {
 }
 
 /// 取 `https://host:port`（去掉 path/query），解析不出来就返回 `None`。
+/// 验证方默认的收数路径（与 [`wist_cred_peer::DEFAULT_BASE_PATH`] 同一个值）。
+///
+/// 这里复制一份而不是引运行期依赖：`wist-cred-peer` 只是示例验证方的 dev-dependency，
+/// 服务二进制不该为了一行常量多背一个 crate。两边是否一致由
+/// `default_push_path_matches_the_peer_crate` 钉住。
+pub(crate) const DEFAULT_PUSH_PATH: &str = "/api/v1/internal/credentials";
+
 pub fn origin_of(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://")?;
     let authority: String = rest
@@ -134,19 +141,56 @@ impl PeerRegistry {
                 .with_context(|| format!("create peer store dir {}", parent.display()))?;
         }
         let data = read(&path)?;
-        let peers = data
+        let mut peers: BTreeMap<String, Peer> = data
             .peers
             .into_iter()
             .map(|peer| (peer.name.clone(), peer))
             .collect();
-        Ok(Self {
+        // 旧记录里的收数地址可能是裸 origin：当时的校验只看了 scheme + authority，
+        // 而推送是 `POST` 到 endpoint 原样 —— 不补路径的话，升级后它照样「探活绿、推送 404」。
+        let mut migrated = false;
+        for peer in peers.values_mut() {
+            let Some(endpoint) = peer.endpoint.clone() else {
+                continue;
+            };
+            match normalize_endpoint(&endpoint) {
+                Ok(normalized) if normalized != endpoint => {
+                    log::warn!(
+                        "peer {:?} endpoint {:?} has no push path; using {normalized:?}",
+                        peer.name,
+                        endpoint
+                    );
+                    peer.endpoint = Some(normalized);
+                    migrated = true;
+                }
+                Ok(_) => {}
+                // 存里的值不合法不该拦住启动：推送时会报出具体原因。
+                Err(err) => log::warn!(
+                    "peer {:?} endpoint {:?} is not a usable URL: {err}",
+                    peer.name,
+                    endpoint
+                ),
+            }
+        }
+        let me = Self {
             path,
             state: Mutex::new(State {
                 peers,
                 health: BTreeMap::new(),
                 revision: data.revision,
             }),
-        })
+        };
+        if migrated {
+            // 落盘失败只告警：内存里的值已经是对的，推送能用；下次写入会再存一次。
+            let snapshot = snapshot(&me.lock());
+            if let Err(error) = write(&me.path, &snapshot) {
+                log::error!(
+                    "persisting normalized peer endpoints to {} failed: {error:#}",
+                    me.path.display()
+                );
+            }
+        }
+        Ok(me)
     }
 
     pub fn path(&self) -> &Path {
@@ -290,10 +334,9 @@ impl PeerRegistry {
         let endpoint = input
             .endpoint
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        if let Some(url) = &endpoint {
-            validate_endpoint(url)?;
-        }
+            .filter(|value| !value.is_empty())
+            .map(|value| normalize_endpoint(&value))
+            .transpose()?;
 
         // 只给了地址没给主机名：从地址里取 —— 证书 SAN 必须与推数时连的地址一致。
         let host = host.or_else(|| endpoint.as_deref().and_then(host_of));
@@ -373,7 +416,11 @@ impl PeerRegistry {
             changed = true;
         }
         if peer.endpoint.is_none() {
-            peer.endpoint = endpoint.map(str::to_string);
+            // 上报值也要归一化：走接入脚本的路径同样可能只给 origin。
+            peer.endpoint = endpoint
+                .map(normalize_endpoint)
+                .transpose()
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
             changed |= peer.endpoint.is_some();
         }
         if !roles.is_empty() {
@@ -410,17 +457,18 @@ impl PeerRegistry {
     ///
     /// 与 `fill_endpoint` 相反：这里**覆盖**，因为是人明确要求的。
     pub fn set_endpoint(&self, name: &str, endpoint: Option<&str>) -> Result<Peer, PeerError> {
-        let endpoint = endpoint.map(str::trim).filter(|value| !value.is_empty());
-        if let Some(url) = endpoint {
-            validate_endpoint(url)?;
-        }
+        let endpoint = endpoint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(normalize_endpoint)
+            .transpose()?;
 
         let mut state = self.lock();
         let Some(peer) = state.peers.get_mut(name) else {
             return Err(PeerError::NotFound(name.to_string()));
         };
         let previous = peer.endpoint.clone();
-        peer.endpoint = endpoint.map(str::to_string);
+        peer.endpoint = endpoint;
         let updated = peer.clone();
         let revision = state.revision;
         state.revision += 1;
@@ -558,7 +606,18 @@ fn validate_host(host: &str) -> Result<(), PeerError> {
     Ok(())
 }
 
-fn validate_endpoint(url: &str) -> Result<(), PeerError> {
+/// 校验并**归一化**收数地址。
+///
+/// 为什么必须归一：`endpoint` 在两个地方用，口径不一样
+/// —— 心跳探活取的是 `origin + /healthz`（`probe_url`），而推送是 `POST` 到
+/// `endpoint` **原样**。只填 `https://host:3103` 也能存、也能探活绿，
+/// 但每条推送都会打到根路径上 → `404`。
+///
+/// 规则：
+/// - 只收 `https://`（推送是双向 TLS）；
+/// - **没有路径**（或只有 `/`）→ 补上默认收数路径；
+/// - **有路径**→ 原样保留（X 可以把 listener 挂在别处，那是它的配置自由）。
+fn normalize_endpoint(url: &str) -> Result<String, PeerError> {
     let Some(origin) = origin_of(url) else {
         return Err(PeerError::BadRequest(
             "endpoint must be an https:// URL (push is mutual TLS only)".to_string(),
@@ -576,7 +635,21 @@ fn validate_endpoint(url: &str) -> Result<(), PeerError> {
                 .to_string(),
         ));
     }
-    Ok(())
+
+    // origin 之后的部分是「路径 [+ ?query / #fragment]」。
+    let rest = &url[origin.len()..];
+    let cut = rest.find(['?', '#']).unwrap_or(rest.len());
+    let (path, tail) = rest.split_at(cut);
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        Ok(format!("{origin}{DEFAULT_PUSH_PATH}{tail}"))
+    } else {
+        Ok(format!("{origin}{path}{tail}"))
+    }
+}
+
+fn validate_endpoint(url: &str) -> Result<(), PeerError> {
+    normalize_endpoint(url).map(|_| ())
 }
 
 /// 从 `https://host:port/path` 取 `host`。
@@ -903,6 +976,128 @@ mod tests {
         input.endpoint = Some("http://ingest.internal/credentials".to_string());
         let err = registry.create(input, "alice").expect_err("plaintext push");
         assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
+    }
+
+    // ── 收数地址的归一化（能存、能探活、但发不出去的坑）──────────────────
+
+    #[test]
+    fn a_bare_origin_gets_the_push_path() {
+        let dir = TempDir::new();
+        let created = registry(&dir)
+            .create(
+                {
+                    let mut input = new_peer("wist-center");
+                    // 页面/脚本上最自然的填法：只给 origin。
+                    input.endpoint = Some("https://center.internal:3103".to_string());
+                    input
+                },
+                "alice",
+            )
+            .expect("create");
+        assert_eq!(
+            created.endpoint.as_deref(),
+            Some("https://center.internal:3103/api/v1/internal/credentials")
+        );
+        // 落盘的是归一化后的值，重启不会退回裸 origin。
+        let reopened = registry(&dir);
+        assert_eq!(
+            reopened.get("wist-center").unwrap().endpoint.as_deref(),
+            Some("https://center.internal:3103/api/v1/internal/credentials")
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_is_trimmed_but_an_explicit_path_is_kept() {
+        // 只有 `/` → 当作没写路径（axum 的精确路由不认尾斜杠）。
+        assert_eq!(
+            normalize_endpoint("https://h:19443/").unwrap(),
+            "https://h:19443/api/v1/internal/credentials"
+        );
+        // X 把 listener 挂在别处是它的配置自由，有路径就原样保留。
+        assert_eq!(
+            normalize_endpoint("https://h:19443/custom/creds/").unwrap(),
+            "https://h:19443/custom/creds"
+        );
+        // 已经是标准形态的：不动（幂等）。
+        assert_eq!(
+            normalize_endpoint("https://h:19443/api/v1/internal/credentials").unwrap(),
+            "https://h:19443/api/v1/internal/credentials"
+        );
+    }
+
+    #[test]
+    fn set_endpoint_normalizes_a_bare_origin() {
+        let dir = TempDir::new();
+        let registry = registry(&dir);
+        registry
+            .create(new_peer("wist-center"), "alice")
+            .expect("create");
+        let updated = registry
+            .set_endpoint("wist-center", Some("https://h:3103"))
+            .expect("set");
+        assert_eq!(
+            updated.endpoint.as_deref(),
+            Some("https://h:3103/api/v1/internal/credentials")
+        );
+        // 探活还是从 origin 推：不会变成 `<path>/healthz`。
+        assert_eq!(
+            updated.probe_url().as_deref(),
+            Some("https://h:3103/healthz")
+        );
+    }
+
+    #[test]
+    fn report_normalizes_a_bare_origin() {
+        let dir = TempDir::new();
+        let registry = registry(&dir);
+        let mut input = new_peer("wist-center");
+        input.endpoint = None;
+        registry.create(input, "alice").expect("create");
+        registry
+            .report(
+                "wist-center",
+                None,
+                Some("https://h:3103"),
+                &["read".to_string()],
+            )
+            .expect("report");
+        assert_eq!(
+            registry.get("wist-center").unwrap().endpoint.as_deref(),
+            Some("https://h:3103/api/v1/internal/credentials")
+        );
+    }
+
+    /// 这行常量是 `wist-cred-peer::DEFAULT_BASE_PATH` 的副本（运行期不引那个 crate）：
+    /// 两边一漂，cred 就会把摘要发到 X 认的路径之外 —— 那时候只能看到 404。
+    #[test]
+    fn default_push_path_matches_the_peer_crate() {
+        assert_eq!(DEFAULT_PUSH_PATH, wist_cred_peer::DEFAULT_BASE_PATH);
+    }
+
+    /// 升级前就存进去的裸 origin（当时校验放行）也要能用：加载时补路径并回写。
+    #[test]
+    fn a_stored_bare_origin_is_migrated_on_open() {
+        let dir = TempDir::new();
+        let path = dir.0.join("peers.json");
+        fs::write(
+            &path,
+            r#"{"revision":3,"peers":[{"name":"wist-center","host":"h",
+               "endpoint":"https://h:3103","roles":["admin"],
+               "created_at":1,"created_by":"alice"}]}"#,
+        )
+        .expect("seed store");
+
+        let registry = PeerRegistry::open(path.clone()).expect("open");
+        assert_eq!(
+            registry.get("wist-center").unwrap().endpoint.as_deref(),
+            Some("https://h:3103/api/v1/internal/credentials")
+        );
+        // 回写过了：下次启动不需要再迁移。
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("https://h:3103/api/v1/internal/credentials"),
+            "{text}"
+        );
     }
 
     #[test]

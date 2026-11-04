@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.4.12-alpha] - 2026-11-04
+
+### 修复：收数地址少了路径 —— 「探活绿、推送 404」
+
+`endpoint`（X 的收数地址）在两个地方用，口径本来就不一样：
+
+| 用途 | 取值 |
+|---|---|
+| 心跳探活 | `origin` + `/healthz`（`probe_url` 会把路径剥掉） |
+| 推送 register / revoke | `POST endpoint` **原样** |
+
+而校验只看了 scheme + authority，所以 `https://host:3103` 这种只给 origin 的写法
+**存得进去、探得活，但每条推送都打到根路径 → `404 Not Found`**，报错里也没有任何线索。
+本地联调时就这么坑了一次（凭据建出来了但没送到，只能 `redeliver`）。
+
+现在：
+
+- **落库前归一化**（`create` / 接入上报 `report` / 改地址 `set_endpoint` 三条写路径统一）：
+  没有路径或只有 `/` → 补上默认收数路径；**已经有路径就原样保留**（X 可以把 listener 挂在别处）。
+  尾斜杠会被去掉（axum 的精确路由不认尾斜杠）。
+- **加载旧存储时也迁移一次**：升级前就存进去的裸 origin 会被补上路径并回写，
+  不用重跑接入命令。
+- **推送 404 的报错点名原因**：直接说 endpoint 没命中收数路由、应该带上哪个路径。
+
+默认收数路径常量复制了一份（服务二进制不引 `wist-cred-peer`，它只是示例验证方的 dev-dependency），
+并由 `default_push_path_matches_the_peer_crate` 钉住两边一致。
+
+新增用例：`a_bare_origin_gets_the_push_path`、`a_trailing_slash_is_trimmed_but_an_explicit_path_is_kept`、
+`set_endpoint_normalizes_a_bare_origin`、`report_normalizes_a_bare_origin`、
+`a_stored_bare_origin_is_migrated_on_open`、`default_push_path_matches_the_peer_crate`，
+以及 API 层的 `an_endpoint_posted_without_a_path_comes_back_normalized`。
+
 ## [0.4.11-alpha] - 2026-11-03
 
 ### 新增：真正跑脚本的端到端测试（`tests/onboarding_e2e.rs`）

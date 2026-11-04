@@ -134,6 +134,16 @@ impl Pusher {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // 404 几乎总是收数地址写成了裸 origin（能探活、发不出去）。
+                // 不点名的话，现场只能看到一句 `404 Not Found`。
+                bail!(
+                    "push register to {peer} rejected: {status} {text} \
+                     (endpoint {endpoint:?} did not match the verifier's push route; \
+                     it must include the push path, e.g. {})",
+                    crate::peers::DEFAULT_PUSH_PATH
+                );
+            }
             bail!("push register to {peer} rejected: {status} {text}");
         }
         Ok(())
