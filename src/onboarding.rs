@@ -436,15 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn stack_roots_get_a_warning_about_identity_location() {
+    fn stack_roots_refuse_identity_outside_identity_dir() {
         // 部署栈里身份材料要进 identity/（contract/备份 + .gitignore）；
-        // 落在 ./wist-cred/<peer> 时私钥会出现在 `git status` 里。
+        // 落在 ./wist-cred/<peer> 时私钥直接出现在 `git status` 里 —— 现场真发生过。
+        // 这里改成**硬失败**（在登记之前，券不会白烧），另留一个显式逃生门。
         let peer = peer_for("wist-center", &[]);
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
         let script =
             render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
-        assert!(script.contains("当前目录是一个部署栈：身份材料建议用 --dir ./identity/<peer>"));
-        assert!(script.contains("私钥会被 git 看到"));
+        assert!(script.contains("身份材料必须落 ./identity/<peer>"));
+        assert!(script.contains("WIST_CRED_ALLOW_UNSAFE_DIR=1"));
+        assert!(script.contains("券还没用掉"));
     }
 
     #[test]

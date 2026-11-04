@@ -111,8 +111,14 @@ if [[ -f sys-prj.yml && -d identity ]]; then
   case "$INSTALL_DIR" in
     ./identity/*|identity/*) ;;
     *)
-      say "⚠ 当前目录是一个部署栈：身份材料建议用 --dir ./identity/<peer>"
-      say "  （identity/ 进 contract/备份且被 .gitignore 挡住；其它目录里的私钥会被 git 看到）"
+      if [[ "${WIST_CRED_ALLOW_UNSAFE_DIR:-}" == "1" ]]; then
+        say "⚠ 部署栈里把身份材料放在了 ${INSTALL_DIR}（已用 WIST_CRED_ALLOW_UNSAFE_DIR=1 放行）"
+        say "  私钥会被 git 看到；identity/ 才进 contract/备份"
+      else
+        die "这是部署栈：身份材料必须落 ./identity/<peer>（现在指向 ${INSTALL_DIR}）
+  处置：用同一条命令加 --dir ./identity/<peer> 重跑（券还没用掉）；
+        确实要放别处：WIST_CRED_ALLOW_UNSAFE_DIR=1 bash -s -- …"
+      fi
       ;;
   esac
 fi

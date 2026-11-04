@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.10-alpha] - 2026-11-03
+
+### 变更：部署栈里把身份落点改成**硬失败**
+
+0.4.9 只警告，现场仍然在栈里直接跑（不带 `--dir`）—— 结果 `./wist-cred/<peer>/` 下又出了一套私钥，
+而 `identity/center/cred/` 里已经有一套：两套私钥、其中一套在 `git status` 里。
+
+现在在部署栈里（栈根有 `sys-prj.yml` + `identity/`）而落点不在 `identity/` 下时，**登记之前就退出**：
+
+```
+这是部署栈：身份材料必须落 ./identity/<peer>（现在指向 ./wist-cred/wist-center）
+  处置：用同一条命令加 --dir ./identity/<peer> 重跑（券还没用掉）；
+        确实要放别处：WIST_CRED_ALLOW_UNSAFE_DIR=1 bash -s -- …
+```
+
+两个关键点：失败的时点在前置检查（**券不会被烧掉**，同一条命令加 `--dir` 就能重跑）；
+确实要放别处时用环境变量显式放行。
+
 ## [0.4.9-alpha] - 2026-11-03
 
 ### 新增：部署栈里的落点警告
