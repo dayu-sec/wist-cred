@@ -143,6 +143,11 @@ pub fn render_script(
         .replace("__ISSUER_SIGNING_PUB__", issuer_public_hex.unwrap_or(""))
         .replace("__CRED_TOML__", &cred_toml(peer, issuer_public_hex))
         .replace(
+            "__INSTALL_DIR__",
+            // 材料目录是 peer 自己的属性（页面上为该认证系统存的），直接从 peer 取。
+            &shell_single_quoted(peer.install_dir.as_deref().unwrap_or("")),
+        )
+        .replace(
             "__CONFIG_FILE__",
             &shell_single_quoted(config_path.unwrap_or("")),
         )
@@ -315,6 +320,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
@@ -363,6 +369,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
@@ -398,6 +405,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
@@ -598,6 +606,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         }
     }
@@ -615,6 +624,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
@@ -646,6 +656,31 @@ mod tests {
             render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
         assert!(plain.contains("CONFIG_FILE=\"${WIST_CRED_CONFIG_FILE:-}\""));
         assert!(plain.contains("RESTART_CMD=\"${WIST_CRED_RESTART_CMD:-}\""));
+        assert!(
+            plain.contains("INSTALL_DIR=\"${WIST_CRED_INSTALL_DIR:-}\""),
+            "没配材料目录时不能凭空写一个进去"
+        );
+    }
+
+    #[test]
+    fn the_material_dir_is_embedded_so_the_bare_command_works() {
+        // 部署栈里默认落点一定会被护栏拦下，而正确落点只有操作者知道。
+        // 存在认证系统上、签发时烘进脚本之后，`curl … | bash` 裸跑也能落对地方 ——
+        // 不需要人把 --dir 拼回命令里。
+        let peer = Peer {
+            install_dir: Some("./identity/center/cred".to_string()),
+            ..peer_for("wist-center", &[])
+        };
+        let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
+        let script =
+            render_script(&peer, ca, "https://cred.internal/x", None, None, None).expect("render");
+
+        assert!(
+            script.contains("INSTALL_DIR=\"${WIST_CRED_INSTALL_DIR:-./identity/center/cred}\""),
+            "材料目录应当作为默认值内嵌"
+        );
+        // 命令行/环境变量仍然优先（同一条命令可以临时换落点）。
+        assert!(script.contains("--dir)"));
     }
 
     #[test]
@@ -659,6 +694,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
@@ -689,6 +725,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
@@ -715,6 +752,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let err = render_script(&peer, "not a pem", "https://x/y", None, None, None)
@@ -733,6 +771,7 @@ mod tests {
             created_at: 0,
             created_by: "alice".to_string(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         let ca = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";

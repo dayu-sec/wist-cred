@@ -225,6 +225,7 @@ fn peer_view(peer: &Peer, health: &Health) -> Value {
         "endpoint": peer.endpoint,
         "probe_url": peer.probe_url(),
         "roles": peer.roles,
+        "install_dir": peer.install_dir,
         "config_path": peer.config_path,
         "restart_cmd": peer.restart_cmd,
         "created_at": peer.created_at,
@@ -284,6 +285,7 @@ async fn create_peer(
         roles: body.roles,
         // 建的时候不填：接入落点是后续在页面上改的（与“只填名称”同一取向）。
         config_path: None,
+        install_dir: None,
         restart_cmd: None,
     };
     match state.peers.create(input, &operator) {
@@ -380,6 +382,9 @@ async fn set_peer_endpoint(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetSetupRequest {
+    /// 材料目录（接入脚本 `--dir` 的默认值）；`null` / 空串 = 由脚本按场景取默认。
+    #[serde(default)]
+    install_dir: Option<String>,
     /// X 上那份配置文件的路径；`null` / 空串 = 不写文件（只打印片段）。
     #[serde(default)]
     config_path: Option<String>,
@@ -401,6 +406,7 @@ async fn set_peer_setup(
     };
     match state.peers.set_setup(
         &name,
+        body.install_dir.as_deref(),
         body.config_path.as_deref(),
         body.restart_cmd.as_deref(),
     ) {
@@ -1669,6 +1675,7 @@ mod tests {
                         healthz: None,
                         roles: roles.iter().map(|role| (*role).to_string()).collect(),
                         config_path: None,
+                        install_dir: None,
                         restart_cmd: None,
                     },
                     "test",
@@ -1689,6 +1696,7 @@ mod tests {
                         healthz: None,
                         roles: roles.iter().map(|role| (*role).to_string()).collect(),
                         config_path: None,
+                        install_dir: None,
                         restart_cmd: None,
                     },
                     "test",

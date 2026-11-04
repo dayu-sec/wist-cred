@@ -27,9 +27,9 @@ PEER_ENDPOINT='__PEER_ENDPOINT__'
 PEER_ROLES='__PEER_ROLES__'
 ENROLL_URL='__ENROLL_URL__'
 
-# 材料目录：显式给了就用（--dir / WIST_CRED_INSTALL_DIR）；否则按**当前身份**取默认值，
-# 见下面「检查前置条件」。
-INSTALL_DIR="${WIST_CRED_INSTALL_DIR:-}"
+# 材料目录：显式给了就用（--dir / WIST_CRED_INSTALL_DIR）；否则用页面为该认证系统
+# 存的落点（烘进脚本，所以 `curl … | bash` 裸跑也能落对地方）；都没有才按身份取默认值。
+INSTALL_DIR="${WIST_CRED_INSTALL_DIR:-__INSTALL_DIR__}"
 # 接入落点：由操作者在页面上为该认证系统设置，签发时烘进本脚本。
 # 给了 CONFIG_FILE 就**自动写入配置**（不用再回头重新开一张券），
 # 给了 RESTART_CMD 就顺手重启。命令行 `--config` / `--restart` 仍可覆盖。

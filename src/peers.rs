@@ -50,6 +50,14 @@ pub struct Peer {
     pub created_at: i64,
     /// `pki` = 部署种子；否则是操作者名。
     pub created_by: String,
+    /// 材料目录（接入脚本 `--dir` 的默认值）。`None` = 由脚本按场景自己定
+    /// （root → `/etc/wist/<peer>`，否则 `./wist-cred/<peer>`）。
+    ///
+    /// 为什么要存：部署栈里默认值**一定会被护栏拦下**（私钥不能落在 `identity/` 之外），
+    /// 而栈的正确落点只有操作者知道。存下来之后，页面生成的命令直接带上它，
+    /// 谁都不用自己拼 —— 与 `restart_cmd` 同一条口径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_dir: Option<String>,
     /// X 上那份**由人维护**的运行配置（接入脚本 `--config` 的写入目标）。
     /// `None` = 只打印片段，不写任何文件。
     /// 栈部署的服务（center / ingest）**不要填**：它们的配置由 localize 渲染、只读挂载，
@@ -352,6 +360,11 @@ impl PeerRegistry {
             roles: normalize_roles(input.roles).map_err(PeerError::BadRequest)?,
             created_at: now_secs(),
             created_by: by.to_string(),
+            install_dir: clean_setup(
+                input.install_dir.as_deref(),
+                "install_dir",
+                validate_setup_path,
+            )?,
             config_path: clean_setup(
                 input.config_path.as_deref(),
                 "config_path",
@@ -491,9 +504,11 @@ impl PeerRegistry {
     pub fn set_setup(
         &self,
         name: &str,
+        install_dir: Option<&str>,
         config_path: Option<&str>,
         restart_cmd: Option<&str>,
     ) -> Result<Peer, PeerError> {
+        let install_dir = clean_setup(install_dir, "install_dir", validate_setup_path)?;
         let config_path = clean_setup(config_path, "config_path", validate_setup_path)?;
         let restart_cmd = clean_setup(restart_cmd, "restart_cmd", validate_setup_cmd)?;
 
@@ -501,7 +516,12 @@ impl PeerRegistry {
         let Some(peer) = state.peers.get_mut(name) else {
             return Err(PeerError::NotFound(name.to_string()));
         };
-        let previous = (peer.config_path.clone(), peer.restart_cmd.clone());
+        let previous = (
+            peer.install_dir.clone(),
+            peer.config_path.clone(),
+            peer.restart_cmd.clone(),
+        );
+        peer.install_dir = install_dir;
         peer.config_path = config_path;
         peer.restart_cmd = restart_cmd;
         let updated = peer.clone();
@@ -510,8 +530,9 @@ impl PeerRegistry {
         let snapshot = snapshot(&state);
         if let Err(error) = write(&self.path, &snapshot) {
             if let Some(peer) = state.peers.get_mut(name) {
-                peer.config_path = previous.0;
-                peer.restart_cmd = previous.1;
+                peer.install_dir = previous.0;
+                peer.config_path = previous.1;
+                peer.restart_cmd = previous.2;
             }
             state.revision = revision;
             return Err(PeerError::Store(format!("{error:#}")));
@@ -530,6 +551,8 @@ pub struct NewPeer {
     pub healthz: Option<String>,
     /// 可选：对方能验的角色。同上。
     pub roles: Vec<String>,
+    /// 可选：材料目录（接入脚本 `--dir` 的默认值，见 `Peer::install_dir`）。
+    pub install_dir: Option<String>,
     /// 可选：接入脚本要不要顺手写配置、写完要不要重启（见 `Peer::config_path`）。
     pub config_path: Option<String>,
     pub restart_cmd: Option<String>,
@@ -842,6 +865,7 @@ impl RawPeerSeed {
             created_by: "pki".to_string(),
             // 种子不带接入落点：它是给对方机器看的，不是写配置的。
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         })
     }
@@ -891,6 +915,7 @@ mod tests {
             )),
             healthz: None,
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         }
     }
@@ -904,6 +929,7 @@ mod tests {
         let updated = reg
             .set_setup(
                 "ingest",
+                Some("./identity/center/cred"),
                 Some("  /etc/x/ctrl.toml  "),
                 Some("systemctl restart x"),
             )
@@ -913,28 +939,40 @@ mod tests {
             Some("/etc/x/ctrl.toml"),
             "两端空白要去掉"
         );
+        assert_eq!(
+            updated.install_dir.as_deref(),
+            Some("./identity/center/cred"),
+            "材料目录要跟其它接入事实一起存下来"
+        );
         assert_eq!(updated.restart_cmd.as_deref(), Some("systemctl restart x"));
 
         // 重开也能读到（它跟 host / roles 一样是系统事实，不能只在内存里）。
         let reopened = registry(&dir);
         let peer = reopened.get("ingest").expect("peer survives reopen");
         assert_eq!(peer.config_path.as_deref(), Some("/etc/x/ctrl.toml"));
+        assert_eq!(peer.install_dir.as_deref(), Some("./identity/center/cred"));
 
         // 清空 = 回到“只打印片段”。
-        let cleared = reg.set_setup("ingest", None, None).unwrap();
+        let cleared = reg.set_setup("ingest", None, None, None).unwrap();
         assert!(cleared.config_path.is_none() && cleared.restart_cmd.is_none());
+        assert!(cleared.install_dir.is_none());
 
         // 换行会把后面的内容变成新命令：必须拦在写盘之前。
         let err = reg
-            .set_setup("ingest", Some("/etc/x\nrm -rf /"), None)
+            .set_setup("ingest", None, Some("/etc/x\nrm -rf /"), None)
             .expect_err("newline must be rejected");
         assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
         let err = reg
-            .set_setup("ingest", None, Some("a\nb"))
+            .set_setup("ingest", None, None, Some("a\nb"))
+            .expect_err("newline must be rejected");
+        assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
+        // 材料目录同样不能带换行（它会进脚本的单行赋值）。
+        let err = reg
+            .set_setup("ingest", Some("./x\ny"), None, None)
             .expect_err("newline must be rejected");
         assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
 
-        let err = reg.set_setup("nope", Some("/x"), None).unwrap_err();
+        let err = reg.set_setup("nope", None, Some("/x"), None).unwrap_err();
         assert!(matches!(err, PeerError::NotFound(_)), "got {err:?}");
     }
 
@@ -1184,6 +1222,7 @@ mod tests {
             created_at: 0,
             created_by: "x".into(),
             config_path: None,
+            install_dir: None,
             restart_cmd: None,
         };
         assert_eq!(peer.probe_url().as_deref(), Some("https://h:19443/healthz"));
@@ -1386,6 +1425,7 @@ mod tests {
                     healthz: None,
                     roles: Vec::new(),
                     config_path: None,
+                    install_dir: None,
                     restart_cmd: None,
                 },
                 "alice",
@@ -1409,6 +1449,7 @@ mod tests {
                     healthz: None,
                     roles: Vec::new(),
                     config_path: None,
+                    install_dir: None,
                     restart_cmd: None,
                 },
                 "alice",

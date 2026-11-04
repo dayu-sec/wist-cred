@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.15-alpha] - 2026-11-04
+
+### 新增：材料目录成了认证系统的属性（`install_dir`）
+
+上一版只是把「护栏报错」改得好用了一点，但命令还是得人自己拼 `--dir` —— 那不对：
+落点是这个系统的**事实**，该跟名称 / 收数地址 / 重启命令一样存下来。
+
+- `POST /api/v1/peers/{name}/setup` 新增 `install_dir`（材料目录），随 peer 落 `state/peers.json`；
+  `GET /api/v1/peers` 回显它。
+- **签发时烘进脚本**：`INSTALL_DIR="${WIST_CRED_INSTALL_DIR:-<存的目录>}"`。
+  所以页面给的那行 `curl … | bash` **裸跑就落对地方**，不必再补参数；
+  命令行 `--dir` / 环境变量 `WIST_CRED_INSTALL_DIR` 仍然优先。
+- 校验：单行、≤512 字节（无控制字符）—— 与 `config_path` 同一条口径。
+
+web 侧（`wist-cred-web` 0.2.7）在「接入命令」面板加了「材料目录」输入框，
+生成的命令自带 `--dir '…'`。
+
+用例：`setup_fields_round_trip_and_reject_control_characters`（存 / 重开 / 清空 / 拒换行）、
+`the_material_dir_is_embedded_so_the_bare_command_works`、
+以及 e2e `a_stored_material_dir_makes_the_bare_command_work_inside_a_stack`
+（起真 cred → 存落点 → 在栈根**不带任何参数**跑 → 必须落在 `identity/center/cred/cred.toml`）。
+
 ## [0.4.14-alpha] - 2026-11-04
 
 ### 修复：部署栈里的接入命令把人顶死了
