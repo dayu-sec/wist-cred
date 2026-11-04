@@ -134,17 +134,10 @@ impl Pusher {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                // 404 几乎总是收数地址写成了裸 origin（能探活、发不出去）。
-                // 不点名的话，现场只能看到一句 `404 Not Found`。
-                bail!(
-                    "push register to {peer} rejected: {status} {text} \
-                     (endpoint {endpoint:?} did not match the verifier's push route; \
-                     it must include the push path, e.g. {})",
-                    crate::peers::DEFAULT_PUSH_PATH
-                );
-            }
-            bail!("push register to {peer} rejected: {status} {text}");
+            bail!(
+                "{}",
+                Self::reject_reason("register", peer, endpoint, status, &text)
+            );
         }
         Ok(())
     }
@@ -176,10 +169,47 @@ impl Pusher {
             .send()
             .await
             .with_context(|| format!("push revoke to {peer} ({url})"))?;
-        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+        if response.status().is_success() {
             return Ok(());
         }
-        bail!("push revoke to {peer} rejected: HTTP {}", response.status());
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // 对端不认识这条凭据 = 已经是目标状态（可能已清理）。
+            // 但**收数地址写错也是 404**，协议上不可区分 —— 那意味着 token 在对方那边仍然有效。
+            // 不改返回值（撤销必须幂等），只留一条 warn 让现场有机会发现。
+            log::warn!(
+                "push revoke to {peer} ({url}) returned 404; treating as already revoked \
+                 (a wrong endpoint path also looks like this — the token would still be valid there)"
+            );
+            return Ok(());
+        }
+        bail!(
+            "push revoke to {peer} rejected: HTTP {} ({url})",
+            response.status()
+        );
+    }
+
+    /// 推送失败时给现场看的话。
+    ///
+    /// 404 几乎总是收数地址没带路径：`probe_url` 会把路径剔掉（`origin + /healthz`），
+    /// 所以那种地址**探活是绿的**，只有推送会 404。不点名的话，现场只能看到一句
+    /// `404 Not Found`（本地联调就是这么被坑了一次）。
+    fn reject_reason(
+        action: &str,
+        peer: &str,
+        endpoint: &str,
+        status: reqwest::StatusCode,
+        body: &str,
+    ) -> String {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            format!(
+                "push {action} to {peer} rejected: {status} {body}; \
+                 endpoint {endpoint:?} did not match the verifier's push route — \
+                 it must include the push path (e.g. {})",
+                crate::peers::DEFAULT_PUSH_PATH
+            )
+        } else {
+            format!("push {action} to {peer} rejected: {status} {body}")
+        }
     }
 
     /// 心跳：探一次可达性，返回耗时（毫秒）。2xx 才算在线。
@@ -259,5 +289,44 @@ mod tests {
             &signature,
             std::slice::from_ref(&public)
         ));
+    }
+
+    #[test]
+    fn a_404_points_at_the_missing_push_path() {
+        // 「探活绿、推送 404」那个坑：报错必须自己说出原因，
+        // 否则现场只能看到一句 `404 Not Found`。
+        let message = Pusher::reject_reason(
+            "register",
+            "wist-center",
+            "https://h:3103",
+            reqwest::StatusCode::NOT_FOUND,
+            "",
+        );
+        assert!(
+            message.contains("did not match the verifier's push route"),
+            "{message}"
+        );
+        assert!(
+            message.contains(crate::peers::DEFAULT_PUSH_PATH),
+            "the hint must name the path: {message}"
+        );
+        assert!(message.contains("https://h:3103"), "{message}");
+    }
+
+    #[test]
+    fn other_failures_keep_the_plain_message() {
+        let message = Pusher::reject_reason(
+            "register",
+            "wist-center",
+            "https://h:3103/api/v1/internal/credentials",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "boom",
+        );
+        assert!(message.contains("500"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            !message.contains("push route"),
+            "no path hint when the path is not the problem: {message}"
+        );
     }
 }

@@ -80,6 +80,7 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
 | 认证系统名冲突 / 受众重复 | `409 peer_conflict` |
 | 请求里的角色不在该认证系统上报的列表里 | `400 role_not_supported`（错误信息会列出它支持什么） |
 | `endpoint` 不是 `https://` | `400 invalid_peer`（推送走 mTLS，不收明文） |
+| `endpoint` 只给 `https://host:port`（没路径） | 落库时**自动补** `/api/v1/internal/credentials`（已有路径则原样保留，尾斜杠去掉） |
 | 认证系统有 `endpoint` 但推送失败 | `500 credential_delivery_pending`，**不给明文** |
 | 接入券重复兑现 / 过期 | `401 enrollment_rejected`（不区分原因） |
 | 坏 CSR | `400 invalid_csr`，**不消耗券** |

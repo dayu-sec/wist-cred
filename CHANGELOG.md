@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.13-alpha] - 2026-11-04
+
+### 三轮 review 对 0.4.12 的补齐（同一条线，未发布就别留着）
+
+| 问题 | 处置 |
+|---|---|
+| **种子导入绕过归一化** —— `peer.json`（`gen-pki.sh` 从 `CRED_PKI_PEERS` 写的）走 `into_peer`，只校验不归一，填裸 origin 照样「探活绿、推送 404」 | 第三条写入口也接上 `normalize_endpoint` |
+| 路径字符集没约束（空白 / 控制字符） | 拒绝：这些字符会原样进推送请求、也进接入脚本 |
+| `revoke` 的 404 静默当「已撤销」 —— 收数地址写错也是 404，那意味着 token 在对方那边**仍然有效** | 返回值不变（撤销必须幂等），但落一条 warn 点名这个歧义 |
+| `DEFAULT_PUSH_PATH` 插错了位置，把 `origin_of` 的文档注释顶走了 | 位置修正 |
+| 陈旧文档（`fill_endpoint` 早改名为 `report`；README 没写归一化行为） | 一并修正 |
+
+新增用例：`a_path_with_whitespace_or_control_characters_is_rejected`、
+`a_bare_origin_still_yields_the_host`、`a_stored_endpoint_that_is_not_a_url_does_not_block_startup`、
+`a_seed_with_a_bare_origin_is_normalized_on_import`、
+`a_404_points_at_the_missing_push_path`、`other_failures_keep_the_plain_message`。
+
 ## [0.4.12-alpha] - 2026-11-04
 
 ### 修复：收数地址少了路径 —— 「探活绿、推送 404」

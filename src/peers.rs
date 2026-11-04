@@ -79,7 +79,6 @@ impl Peer {
     }
 }
 
-/// 取 `https://host:port`（去掉 path/query），解析不出来就返回 `None`。
 /// 验证方默认的收数路径（与 [`wist_cred_peer::DEFAULT_BASE_PATH`] 同一个值）。
 ///
 /// 这里复制一份而不是引运行期依赖：`wist-cred-peer` 只是示例验证方的 dev-dependency，
@@ -87,6 +86,7 @@ impl Peer {
 /// `default_push_path_matches_the_peer_crate` 钉住。
 pub(crate) const DEFAULT_PUSH_PATH: &str = "/api/v1/internal/credentials";
 
+/// 取 `https://host:port`（去掉 path/query），解析不出来就返回 `None`。
 pub fn origin_of(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://")?;
     let authority: String = rest
@@ -455,7 +455,7 @@ impl PeerRegistry {
 impl PeerRegistry {
     /// 操作者改收数地址（`None` / 空串 = 退回手工分发）。
     ///
-    /// 与 `fill_endpoint` 相反：这里**覆盖**，因为是人明确要求的。
+    /// 与 `report`（只补空）相反：这里**覆盖**，因为是人明确要求的。
     pub fn set_endpoint(&self, name: &str, endpoint: Option<&str>) -> Result<Peer, PeerError> {
         let endpoint = endpoint
             .map(str::trim)
@@ -641,6 +641,13 @@ fn normalize_endpoint(url: &str) -> Result<String, PeerError> {
     let cut = rest.find(['?', '#']).unwrap_or(rest.len());
     let (path, tail) = rest.split_at(cut);
     let path = path.trim_end_matches('/');
+    // 路径不清洗：它会原样进推送请求、也进接入脚本。空白 / 控制字符在 URL 里本来就不合法，
+    // 放进去只会让脚本多一行、报错时看不出来。
+    if rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(PeerError::BadRequest(
+            "endpoint may not contain whitespace or control characters".to_string(),
+        ));
+    }
     if path.is_empty() {
         Ok(format!("{origin}{DEFAULT_PUSH_PATH}{tail}"))
     } else {
@@ -814,7 +821,12 @@ impl RawPeerSeed {
         let endpoint = self
             .endpoint
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            // 种子也是写入口之一（`gen-pki.sh` 按 `CRED_PKI_PEERS` 写）：
+            // 只校验不归一 → 种子里填裸 origin 照样「探活绿、推送 404」。
+            .map(|value| normalize_endpoint(&value))
+            .transpose()
+            .map_err(|err| anyhow::anyhow!("{}: {err}", self.name))?;
         // 种子也是「上报值」的一种：和 enroll 走同一套校验（host 会进脚本、角色会进推送）。
         validate_report(Some(&host), endpoint.as_deref(), &self.roles)
             .map_err(|err| anyhow::anyhow!("{}: {err}", self.name))?;
@@ -1026,6 +1038,40 @@ mod tests {
     }
 
     #[test]
+    fn a_path_with_whitespace_or_control_characters_is_rejected() {
+        // 路径会原样进推送请求，也会被嵌进入接脚本 —— 空白 / 换行只会让脚本多几行、
+        // 也让报错看不出是哪里坏了。URL 里本来就不该有它们。
+        for bad in [
+            "https://h:19443/a b",
+            "https://h:19443/a\nb",
+            "https://h:19443/a\tb",
+            "https://h:19443/api/v1/internal/credentials?x=1\ny=2",
+        ] {
+            let err = normalize_endpoint(bad).expect_err(bad);
+            assert!(matches!(err, PeerError::BadRequest(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_bare_origin_still_yields_the_host() {
+        // 归一化不能把 host 推导弄丢：页面上只填「https://h:3103」时，
+        // 证书 SAN 必须仍然是 h。
+        let dir = TempDir::new();
+        let created = registry(&dir)
+            .create(
+                {
+                    let mut input = new_peer("wist-center");
+                    input.host = None;
+                    input.endpoint = Some("https://h:3103".to_string());
+                    input
+                },
+                "alice",
+            )
+            .expect("create");
+        assert_eq!(created.host.as_deref(), Some("h"));
+    }
+
+    #[test]
     fn set_endpoint_normalizes_a_bare_origin() {
         let dir = TempDir::new();
         let registry = registry(&dir);
@@ -1098,6 +1144,33 @@ mod tests {
             text.contains("https://h:3103/api/v1/internal/credentials"),
             "{text}"
         );
+        // 迁移不改 revision：它不是一次业务变更。
+        assert!(text.contains("\"revision\": 3") || text.contains("\"revision\":3"));
+    }
+
+    /// 盘上有坏地址不该拦住启动（历史数据 / 手改过的文件）：
+    /// 丢掉那条推送能力可以，丢掉整个服务不行。
+    #[test]
+    fn a_stored_endpoint_that_is_not_a_url_does_not_block_startup() {
+        let dir = TempDir::new();
+        let path = dir.0.join("peers.json");
+        fs::write(
+            &path,
+            r#"{"revision":1,"peers":[{"name":"wist-center","host":"h",
+               "endpoint":"http://legacy/x","roles":[],
+               "created_at":1,"created_by":"alice"}]}"#,
+        )
+        .expect("seed store");
+
+        let registry = PeerRegistry::open(path.clone()).expect("open must not fail");
+        // 原值保留（不在加载时静默改数据），推送时才报具体原因。
+        assert_eq!(
+            registry.get("wist-center").unwrap().endpoint.as_deref(),
+            Some("http://legacy/x")
+        );
+        // 也没回写：没东西可迁移。
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("http://legacy/x"), "{text}");
     }
 
     #[test]
@@ -1499,5 +1572,30 @@ mod tests {
         let registry = registry(&dir);
         let error = registry.import_dir(&seeds).expect_err("import must fail");
         assert!(format!("{error:#}").contains("endpoint"), "{error:#}");
+    }
+
+    /// 种子是第三条写入口：`gen-pki.sh` 的 `CRED_PKI_PEERS` 里只写 origin 时，
+    /// 导入后必须是能推送的完整地址。
+    #[test]
+    fn a_seed_with_a_bare_origin_is_normalized_on_import() {
+        let dir = TempDir::new();
+        let seeds = dir.0.join("onboarding");
+        let peer_dir = seeds.join("wist-center");
+        fs::create_dir_all(&peer_dir).expect("seed dir");
+        fs::write(
+            peer_dir.join("peer.json"),
+            r#"{"name":"wist-center","host":"center.internal","endpoint":"https://center.internal:3103"}"#,
+        )
+        .expect("write seed");
+
+        let registry = registry(&dir);
+        assert_eq!(
+            registry.import_dir(&seeds).expect("import"),
+            vec!["wist-center".to_string()]
+        );
+        assert_eq!(
+            registry.get("wist-center").unwrap().endpoint.as_deref(),
+            Some("https://center.internal:3103/api/v1/internal/credentials")
+        );
     }
 }
