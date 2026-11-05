@@ -29,13 +29,17 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `GET /api/v1/peers` | 列出认证系统（含**心跳状态**：`no_endpoint` / `unknown` / `up`+延迟 / `down`+原因） |
 | `POST /api/v1/peers` | 新建认证系统（名称必填，**收数地址可选**）；落 `state/peers.json`，**不需重启** |
 | `POST /api/v1/peers/{name}/endpoint` | 改收数地址（`null` = 撤销地址：随后不再探、不再推，也不能接入） |
-| `POST /api/v1/peers/{name}/setup` | 接入落点：要不要顺手写配置（`config_path`）/ 重启（`restart_cmd`） |
 | `POST /api/v1/peers/{name}/enrollment-tickets` | 签一张**一次性**接入券（默认 900s） |
 | `GET /enroll/{token}/join.sh` | 取出接入脚本（**只有公开材料 + 券，无任何私钥**） |
 | `GET /enroll/{token}/bundle` | 自注册用的公开材料：`client_ca_pem` / `issuer_signing_pub`（券授权、**不消耗**、可重复取） |
 | `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**，一次性） |
 | `GET /healthz` / `GET /version` | 探针 |
 | `GET /api/v1/version` | 版本探针（**无鉴权**）：`name` / `version`（本二进制）+ `stack_version`（部署栈的 `version.txt`，读不到就不返回）；页面右上角三个版本号用它 |
+
+> 接入落点（材料目录 / `config_path` / `restart_cmd`）**只在部署时给**：种子的
+> `identity/…/peer.json`，或栈声明的 `CRED_PEER_DIRS`（只覆盖材料目录）。
+> 原来那条 `POST /api/v1/peers/{name}/setup` 在 0.6.3 删除 —— 页面自 `wist-cred-web 0.4.2`
+> 起已不再提供改它们的入口，留着它只是“改完发现下次签发没生效”的又一条路。
 
 ### 创建
 

@@ -55,14 +55,21 @@ pub struct Peer {
     /// （root → `/etc/wist/<peer>`，否则 `./wist-cred/<peer>`）。
     ///
     /// 为什么要存：部署栈里默认值**一定会被护栏拦下**（私钥不能落在 `identity/` 之外），
-    /// 而栈的正确落点只有操作者知道。存下来之后，页面生成的命令直接带上它，
+    /// 而栈的正确落点只有操作者知道。存下来之后，签发的 `join.sh` 直接带上它，
     /// 谁都不用自己拼 —— 与 `restart_cmd` 同一条口径。
+    ///
+    /// 来源：种子的 `peer.json`，或部署栈声明的 `onboarding.peer_dirs` / `CRED_PEER_DIRS`
+    /// （见 `seed_install_dirs`）。`/peers/{name}/setup` 接口自 0.6.3 起删除，
+    /// 页面（cred-web 0.4.2+）也不再提供改它的入口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_dir: Option<String>,
     /// X 上那份**由人维护**的运行配置（接入脚本 `--config` 的写入目标）。
     /// `None` = 只打印片段，不写任何文件。
     /// 栈部署的服务（center / ingest）**不要填**：它们的配置由 localize 渲染、只读挂载，
     /// 写了也会被下一次渲染覆盖 —— 那些系统改模板。
+    ///
+    /// 只在**种子**（`identity/…/peer.json`）里给：新建接口不收这个字段，
+    /// 也没有再改它的接口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
     /// 写完配置后让它生效的命令（`--restart`），例如 `systemctl restart x`。
@@ -531,7 +538,7 @@ impl PeerRegistry {
     /// 应用部署栈声明的「认证系统 → 材料目录」（`onboarding.peer_dirs`）。
     ///
     /// 规则：
-    /// - **只补空**：页面上已经存过的值优先（人可能更清楚，且页面上改过的不该被重启改回去）；
+    /// - **只补空**：种子里已经给过的值优先（那是更具体的部署事实，且值一旦落下就不该被重启改回去）；
     /// - 声明了一个还不存在的认证系统：跳过 + 告警（它可能是靠页面新建的，还没建）；
     /// - 值不一致：告警，以现有值为准。
     ///
@@ -570,48 +577,6 @@ impl PeerRegistry {
             return Err(error);
         }
         Ok(applied)
-    }
-
-    /// 改“接入落点”：接入脚本要不要顺手写配置、写完要不要重启。
-    ///
-    /// 与 `set_endpoint` 同一套落盘 / 回滚；这里**不动健康结论** —— 它不改变可达性。
-    pub fn set_setup(
-        &self,
-        name: &str,
-        install_dir: Option<&str>,
-        config_path: Option<&str>,
-        restart_cmd: Option<&str>,
-    ) -> Result<Peer, PeerError> {
-        let install_dir = clean_setup(install_dir, "install_dir", validate_setup_path)?;
-        let config_path = clean_setup(config_path, "config_path", validate_setup_path)?;
-        let restart_cmd = clean_setup(restart_cmd, "restart_cmd", validate_setup_cmd)?;
-
-        let mut state = self.lock();
-        let Some(peer) = state.peers.get_mut(name) else {
-            return Err(PeerError::NotFound(name.to_string()));
-        };
-        let previous = (
-            peer.install_dir.clone(),
-            peer.config_path.clone(),
-            peer.restart_cmd.clone(),
-        );
-        peer.install_dir = install_dir;
-        peer.config_path = config_path;
-        peer.restart_cmd = restart_cmd;
-        let updated = peer.clone();
-        let revision = state.revision;
-        state.revision += 1;
-        let snapshot = snapshot(&state);
-        if let Err(error) = write(&self.path, &snapshot) {
-            if let Some(peer) = state.peers.get_mut(name) {
-                peer.install_dir = previous.0;
-                peer.config_path = previous.1;
-                peer.restart_cmd = previous.2;
-            }
-            state.revision = revision;
-            return Err(PeerError::Store(format!("{error:#}")));
-        }
-        Ok(updated)
     }
 }
 
@@ -990,31 +955,30 @@ mod tests {
         }
     }
 
+    /// 接入落点（材料目录 / 配置 / 重启）现在只有一个入口：**新建**（种子里给）。
+    /// 改不了 —— `/peers/{name}/setup` 接口 0.6.3 删除，页面也不再提供入口。
     #[test]
-    fn setup_fields_round_trip_and_reject_control_characters() {
+    fn setup_fields_are_accepted_at_creation_and_reject_control_characters() {
         let dir = TempDir::new();
         let reg = registry(&dir);
-        reg.create(new_peer("ingest"), "alice").unwrap();
+        let mut peer = new_peer("ingest");
+        peer.install_dir = Some("  ./identity/center/cred  ".to_string());
+        peer.config_path = Some("  /etc/x/ctrl.toml  ".to_string());
+        peer.restart_cmd = Some("systemctl restart x".to_string());
+        reg.create(peer, "alice").expect("setup persists");
 
-        let updated = reg
-            .set_setup(
-                "ingest",
-                Some("./identity/center/cred"),
-                Some("  /etc/x/ctrl.toml  "),
-                Some("systemctl restart x"),
-            )
-            .expect("setup persists");
+        let stored = reg.get("ingest").expect("peer");
         assert_eq!(
-            updated.config_path.as_deref(),
+            stored.config_path.as_deref(),
             Some("/etc/x/ctrl.toml"),
             "两端空白要去掉"
         );
         assert_eq!(
-            updated.install_dir.as_deref(),
+            stored.install_dir.as_deref(),
             Some("./identity/center/cred"),
             "材料目录要跟其它接入事实一起存下来"
         );
-        assert_eq!(updated.restart_cmd.as_deref(), Some("systemctl restart x"));
+        assert_eq!(stored.restart_cmd.as_deref(), Some("systemctl restart x"));
 
         // 重开也能读到（它跟 host / roles 一样是系统事实，不能只在内存里）。
         let reopened = registry(&dir);
@@ -1022,28 +986,27 @@ mod tests {
         assert_eq!(peer.config_path.as_deref(), Some("/etc/x/ctrl.toml"));
         assert_eq!(peer.install_dir.as_deref(), Some("./identity/center/cred"));
 
-        // 清空 = 回到“只打印片段”。
-        let cleared = reg.set_setup("ingest", None, None, None).unwrap();
-        assert!(cleared.config_path.is_none() && cleared.restart_cmd.is_none());
-        assert!(cleared.install_dir.is_none());
-
         // 换行会把后面的内容变成新命令：必须拦在写盘之前。
+        let mut bad = new_peer("bad-config");
+        bad.config_path = Some("/etc/x\nrm -rf /".to_string());
         let err = reg
-            .set_setup("ingest", None, Some("/etc/x\nrm -rf /"), None)
-            .expect_err("newline must be rejected");
-        assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
-        let err = reg
-            .set_setup("ingest", None, None, Some("a\nb"))
-            .expect_err("newline must be rejected");
-        assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
-        // 材料目录同样不能带换行（它会进脚本的单行赋值）。
-        let err = reg
-            .set_setup("ingest", Some("./x\ny"), None, None)
+            .create(bad, "alice")
             .expect_err("newline must be rejected");
         assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
 
-        let err = reg.set_setup("nope", None, Some("/x"), None).unwrap_err();
-        assert!(matches!(err, PeerError::NotFound(_)), "got {err:?}");
+        let mut bad = new_peer("bad-dir");
+        bad.install_dir = Some("./x\ny".to_string());
+        let err = reg
+            .create(bad, "alice")
+            .expect_err("newline must be rejected");
+        assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
+
+        let mut bad = new_peer("bad-restart");
+        bad.restart_cmd = Some("a\nb".to_string());
+        let err = reg
+            .create(bad, "alice")
+            .expect_err("newline must be rejected");
+        assert!(matches!(err, PeerError::BadRequest(_)), "got {err:?}");
     }
 
     #[test]
@@ -1714,10 +1677,10 @@ mod tests {
         let dir = TempDir::new();
         let reg = registry(&dir);
         reg.create(new_peer("wist-center"), "alice").unwrap();
-        reg.create(new_peer("wist-ingest"), "alice").unwrap();
-        // 人已经在页面上选过的那个不许被重启改回去。
-        reg.set_setup("wist-ingest", Some("./picked/by/human"), None, None)
-            .unwrap();
+        // 种子里已经给过的那个不许被栈声明改回去。
+        let mut picked = new_peer("wist-ingest");
+        picked.install_dir = Some("./from/seed".to_string());
+        reg.create(picked, "alice").unwrap();
 
         let applied = reg
             .seed_install_dirs(&[
@@ -1738,8 +1701,8 @@ mod tests {
         );
         assert_eq!(
             reg.get("wist-ingest").unwrap().install_dir.as_deref(),
-            Some("./picked/by/human"),
-            "页面上存过的优先"
+            Some("./from/seed"),
+            "种子里给过的优先"
         );
         // 落盘了：重启不再需要重新声明。
         assert_eq!(

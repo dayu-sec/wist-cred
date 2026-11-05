@@ -312,32 +312,19 @@ async fn a_stack_with_one_identity_dir_suggests_the_dir_its_consumer_expects() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stored_material_dir_makes_the_bare_command_work_inside_a_stack() {
-    // 用户视角的底线：页面给的那一行命令**原样粘过去就能跑**，不需要自己拼 --dir。
+    // 用户视角的底线：页面给的那张券换来的 `join.sh` **原样粘过去就能跑**，不需要自己拼 --dir。
+    //
+    // 材料目录只在种子 / 栈声明时给（`/peers/{name}/setup` 接口 0.6.3 删除）：
+    // 这里走部署栈的真实路径 —— `CRED_PEER_DIRS` 对应的 `seed_install_dirs`。
     let harness = start("stored-dir").await;
-    let api = format!("http://{}/api/v1/peers/wist-center/setup", harness.addr);
-    let body = r#"{"install_dir":"./identity/center/cred"}"#;
-    let out = Command::new("curl")
-        .args([
-            "-sS",
-            "-X",
-            "POST",
-            "-H",
-            &format!("{OPERATOR_HEADER}: alice"),
-            "-H",
-            "content-type: application/json",
-            "-d",
-            body,
-            &api,
-        ])
-        .output()
-        .expect("curl setup");
-    assert!(
-        out.status.success(),
-        "setup 失败：{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    harness
+        .peers
+        .seed_install_dirs(&[(
+            "wist-center".to_string(),
+            "./identity/center/cred".to_string(),
+        )])
+        .expect("seed peer dirs");
 
-    // 重新签发（脚本是签发时渲染的），再在栈根**不带任何参数**地跑。
     let script = harness.fetch_script(&harness.dir.join("join-stored.sh"));
     let stack = harness.dir.join("stack-stored");
     std::fs::create_dir_all(stack.join("identity")).expect("stack dirs");
@@ -348,7 +335,7 @@ async fn a_stored_material_dir_makes_the_bare_command_work_inside_a_stack() {
     assert!(out.status.success(), "裸命令应当直接跑通：\n{text}");
     assert!(
         stack.join("identity/center/cred/cred.toml").is_file(),
-        "材料应当落在页面存的目录里：\n{text}"
+        "材料应当落在声明的目录里：\n{text}"
     );
     assert!(
         !stack.join("wist-cred").exists(),

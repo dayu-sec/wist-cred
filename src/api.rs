@@ -102,8 +102,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/peers", get(list_peers).post(create_peer))
         .route("/api/v1/peers/{name}/enrollment-tickets", post(mint_script))
         .route("/api/v1/peers/{name}/endpoint", post(set_peer_endpoint))
-        // 接入落点（配置文件 + 重启命令）：挂在系统上，签发时烘进脚本。
-        .route("/api/v1/peers/{name}/setup", post(set_peer_setup))
         .route(
             "/api/v1/onboarding/peers",
             get(list_peers).post(create_peer),
@@ -372,77 +370,6 @@ async fn set_peer_endpoint(
                 "peer endpoint updated: name={} endpoint={:?} by={operator}",
                 updated.name,
                 updated.endpoint
-            );
-            Json(peer_view(&updated, &state.peers.health(&updated.name))).into_response()
-        }
-        Err(PeerError::BadRequest(message)) => {
-            err(StatusCode::BAD_REQUEST, "invalid_peer", message)
-        }
-        Err(PeerError::NotFound(_)) => err(
-            StatusCode::NOT_FOUND,
-            "unknown_peer",
-            format!("no auth system named {name:?}"),
-        ),
-        Err(PeerError::Conflict(message)) => err(StatusCode::CONFLICT, "peer_conflict", message),
-        Err(PeerError::Store(message)) => {
-            log::error!("peer store failed: {message}");
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store_unavailable",
-                "failed to persist the peer",
-            )
-        }
-    }
-}
-
-/// 改“接入落点”：接入脚本要不要顺手写配置、写完要不要重启。
-///
-/// 挂在**认证系统**上而不是每条券上：这是该系统的事实（与 host / roles 同类），
-/// 下一次点「接入命令」就自带 —— 不用为了补 `--config` 再开一张券。
-///
-/// 注意：栈部署的系统（center / ingest）**不要填** `config_path` —— 它们的配置由
-/// localize 渲染、只读挂载，脚本写进去会被下一次渲染覆盖。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SetSetupRequest {
-    /// 材料目录（接入脚本 `--dir` 的默认值）；`null` / 空串 = 由脚本按场景取默认。
-    #[serde(default)]
-    install_dir: Option<String>,
-    /// X 上那份配置文件的路径；`null` / 空串 = 不写文件（只打印片段）。
-    #[serde(default)]
-    config_path: Option<String>,
-    /// 写完后让配置生效的命令；`null` / 空串 = 只提示。
-    #[serde(default)]
-    restart_cmd: Option<String>,
-}
-
-async fn set_peer_setup(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    AxumPath(name): AxumPath<String>,
-    Json(body): Json<SetSetupRequest>,
-) -> Response {
-    let operator = match authorize(&state.config, peer, &headers) {
-        Ok(operator) => operator,
-        Err(denied) => return denied.into_response(),
-    };
-    match state.peers.set_setup(
-        &name,
-        body.install_dir.as_deref(),
-        body.config_path.as_deref(),
-        body.restart_cmd.as_deref(),
-    ) {
-        Ok(updated) => {
-            log::info!(
-                "peer setup updated: name={} config_path={:?} restart={} by={operator}",
-                updated.name,
-                updated.config_path,
-                if updated.restart_cmd.is_some() {
-                    "yes"
-                } else {
-                    "no"
-                }
             );
             Json(peer_view(&updated, &state.peers.health(&updated.name))).into_response()
         }
@@ -2811,27 +2738,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_endpoint_is_remembered_and_reaches_the_script() {
-        // “命令自带 --config”的端到端：存一次，之后每次签发的脚本都带着它。
-        let harness = Harness::new()
-            .with_peer("wist-ingest", "ingest.internal")
-            .with_signer();
-
-        let (status, body) = harness
-            .call(
-                "POST",
-                "/api/v1/peers/wist-ingest/setup",
-                Some("alice"),
-                "127.0.0.1",
-                Some(json!({
-                    "config_path": "/etc/x/ctrl.toml",
-                    "restart_cmd": "systemctl restart x"
-                })),
+    async fn setup_from_the_seed_reaches_the_script() {
+        // “命令自带 --config / --restart”的端到端：种子（`identity/…/peer.json`）里给一次，
+        // 之后每次签发的脚本都带着它。改它的接口（`/peers/{name}/setup`）0.6.3 已删除，
+        // 所以这里从**新建**（种子的同一入口）进去，而不是先建后改。
+        let harness = Harness::new().with_signer();
+        harness
+            .state
+            .peers
+            .create(
+                NewPeer {
+                    name: "wist-ingest".to_string(),
+                    host: Some("ingest.internal".to_string()),
+                    endpoint: Some(
+                        "https://ingest.internal:19443/api/v1/internal/credentials".to_string(),
+                    ),
+                    healthz: None,
+                    roles: vec!["investigation:run".to_string()],
+                    install_dir: Some("./identity/ingest/cred".to_string()),
+                    config_path: Some("/etc/x/ctrl.toml".to_string()),
+                    restart_cmd: Some("systemctl restart x".to_string()),
+                },
+                "pki",
             )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["config_path"], "/etc/x/ctrl.toml");
-        assert_eq!(body["restart_cmd"], "systemctl restart x");
+            .expect("create peer with setup");
 
         let (status, minted) = harness
             .call(
@@ -2854,19 +2784,30 @@ mod tests {
             script.contains("WIST_CRED_RESTART_CMD:-systemctl restart x"),
             "脚本里应当自带重启命令\ngot: {script}"
         );
+        assert!(
+            script.contains("WIST_CRED_INSTALL_DIR:-./identity/ingest/cred"),
+            "脚本里应当自带材料目录\ngot: {script}"
+        );
+    }
 
-        // 换行要在入口就拦住：它是单行 shell 赋值。
-        let (status, body) = harness
+    /// 改接入落点的那条路由已经不存在了：旧页面（< 0.4.2）调它应当得到 404，
+    /// 而不是“静默成功、下次签发才发现没生效”。
+    #[tokio::test]
+    async fn setup_endpoint_is_gone() {
+        let harness = Harness::new()
+            .with_peer("wist-ingest", "ingest.internal")
+            .with_signer();
+
+        let (status, _) = harness
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/setup",
                 Some("alice"),
                 "127.0.0.1",
-                Some(json!({"config_path": "/etc/x\nrm -rf /"})),
+                Some(json!({"config_path": "/etc/x/ctrl.toml"})),
             )
             .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_peer");
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
