@@ -348,9 +348,8 @@ impl PeerRegistry {
 
     /// 新建一个认证系统。
     ///
-    /// **名称与收数地址都是必填**：没有地址的认证系统既不能被探活、也收不到推送，
-    /// 而接入脚本已经不接受地址参数（那是部署事实，不是命令行参数），
-    /// 所以放进来一条空壳记录只会制造“登记成功、什么都不动”。
+    /// **名称必填，收数地址可选**：自注册（`cred-peer` 初始化）会带着地址进来；
+    /// 建完但还没注册的记录显示 `no_endpoint`（这是真的：还没人告诉 cred 往哪推）。
     pub fn create(&self, input: NewPeer, by: &str) -> Result<Peer, PeerError> {
         let name = input.name.trim().to_string();
         validate_name(&name)?;
@@ -368,31 +367,25 @@ impl PeerRegistry {
             .filter(|value| !value.is_empty())
             .map(|value| normalize_endpoint(&value))
             .transpose()?;
-        let Some(endpoint) = endpoint else {
-            return Err(PeerError::BadRequest(
-                "endpoint is required: without it cred can neither probe nor push to this system, \
-                 and enrollment is refused rather than leaving a silent shell record"
-                    .to_string(),
-            ));
-        };
 
-        // 只给了地址没给主机名：从地址里取 —— 证书 SAN 必须与推数时连的地址一致。
-        if let (Some(host), Some(url_host)) = (host.as_deref(), host_of(&endpoint))
+        // 两者都给了就必须对得上：证书 SAN 必须等于 cred 推数时连的地址，否则握手必然失败。
+        // 与其让它到心跳里变成一条 TLS 错，不如建的时候就拒。
+        if let (Some(host), Some(endpoint)) = (host.as_deref(), endpoint.as_deref())
+            && let Some(url_host) = host_of(endpoint)
             && host != url_host
         {
-            // 签出来的证书 SAN 与 cred 推数时连的地址不一致 → 握手必然失败。
-            // 与其让它到心跳里变成一条 TLS 错，不如建的时候就拒。
             return Err(PeerError::BadRequest(format!(
                 "host {host:?} does not match the endpoint host {url_host:?}: \
                  the certificate SAN must match where cred connects"
             )));
         }
-        let host = host.or_else(|| host_of(&endpoint));
+        // 只给了地址没给主机名：从地址里取。
+        let host = host.or_else(|| endpoint.as_deref().and_then(host_of));
 
         let peer = Peer {
             name: name.clone(),
             host,
-            endpoint: Some(endpoint),
+            endpoint,
             healthz: input
                 .healthz
                 .map(|value| value.trim().to_string())
@@ -435,23 +428,37 @@ impl PeerRegistry {
         Ok(peer)
     }
 
-    /// 登记时接收对方上报的**角色**。
+    /// 登记时接收对方上报的身份：`endpoint`（收数地址）与 `roles`。
     ///
-    /// **不收收数地址、也不用 host**：
-    /// - 地址是部署登记的事实（页面 / `CRED_PKI_PEERS`），不是接入脚本的参数；
-    /// - 主机名在建/种子时就定了（由地址推出或显式给），enroll 已经把“上报的主机名是否
-    ///   相符”拦在前面了，这里再写一次只会多一条可能漂移的路径。
+    /// 为什么这里能收地址：它只能随一张**一次性券**提交（`enroll` 兑现券后才调到这里），
+    /// 而 `--advertise` 是未授权命令通道上的任意字符串 —— 两者不是一回事。
     ///
-    /// `roles` **上报非空就覆盖**：它是 X 自己的词汇表，重跑接入命令就是改它；
-    /// 上报空值只是“这次没说”，不当成清空。
-    pub fn report(&self, name: &str, roles: &[String]) -> anyhow::Result<()> {
-        validate_report(None, roles).map_err(anyhow::Error::msg)?;
+    /// 规则：
+    /// - `endpoint` **只补空**（人工/种子设过的值优先），并归一化成完整收数路径；
+    /// - `roles` **上报非空就覆盖**：它是 X 自己的词汇表，重跑接入命令就是改它；
+    ///   上报空值只是“这次没说”，不当成清空。
+    pub fn report(
+        &self,
+        name: &str,
+        endpoint: Option<&str>,
+        roles: &[String],
+    ) -> anyhow::Result<()> {
+        let endpoint = endpoint.map(str::trim).filter(|value| !value.is_empty());
+        validate_report(None, endpoint, roles).map_err(anyhow::Error::msg)?;
 
         let mut state = self.lock();
         let Some(peer) = state.peers.get_mut(name) else {
             return Ok(());
         };
         let mut changed = false;
+        if peer.endpoint.is_none() {
+            // 上报值也要归一化：只给 origin 时补默认收数路径。
+            peer.endpoint = endpoint
+                .map(normalize_endpoint)
+                .transpose()
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            changed |= peer.endpoint.is_some();
+        }
         if !roles.is_empty() {
             // 角色是 X 的词汇表：上报**非空就以它为准**（重跑接入命令 = 改角色）。
             // 空 = 这次没说（脚本可能没带 `--roles`），不能当成“清空”。
@@ -749,11 +756,27 @@ pub fn host_of(url: &str) -> Option<String> {
 
 /// 登记上报值的**无状态校验**。
 ///
-/// `enroll` 在**烧掉一次性券之前**先调它：主机名 / 角色不合法是“输入错”，
+/// `enroll` 在**烧掉一次性券之前**先调它：主机名 / 地址 / 角色不合法是“输入错”，
 /// 不该把券变成一次性的代价。`report` 也调它，保持两边一套规则。
-pub(crate) fn validate_report(host: Option<&str>, roles: &[String]) -> Result<(), String> {
+pub(crate) fn validate_report(
+    host: Option<&str>,
+    endpoint: Option<&str>,
+    roles: &[String],
+) -> Result<(), String> {
+    if let Some(url) = endpoint {
+        normalize_endpoint(url).map_err(|err| err.to_string())?;
+    }
     if let Some(host) = host {
         validate_host(host).map_err(|err| err.to_string())?;
+        if let Some(url) = endpoint
+            && let Some(url_host) = host_of(url)
+            && url_host != host
+        {
+            return Err(format!(
+                "reported host {host:?} does not match the endpoint host {url_host:?}; \
+                 the certificate SAN must match where cred connects"
+            ));
+        }
     }
     normalize_roles(roles.to_vec())?;
     Ok(())
@@ -891,7 +914,7 @@ impl RawPeerSeed {
             .transpose()
             .map_err(|err| anyhow::anyhow!("{}: {err}", self.name))?;
         // 种子也是「上报值」的一种：和 enroll 走同一套校验（host 会进脚本、角色会进推送）。
-        validate_report(Some(&host), &self.roles)
+        validate_report(Some(&host), endpoint.as_deref(), &self.roles)
             .map_err(|err| anyhow::anyhow!("{}: {err}", self.name))?;
         let roles =
             normalize_roles(self.roles).map_err(|err| anyhow::anyhow!("{}: {err}", self.name))?;
@@ -1172,19 +1195,33 @@ mod tests {
     }
 
     #[test]
-    fn report_never_touches_the_registered_endpoint() {
-        // 地址是部署登记的事实，接入上报改不了它 —— 包括归一化也不该由这边做。
+    fn report_only_fills_the_empty_endpoint() {
+        // 上报的地址只补空：人工/种子设过的值优先；只给 origin 时归一化成完整收数路径。
         let dir = TempDir::new();
         let registry = registry(&dir);
+        let mut input = new_peer("wist-center");
+        input.endpoint = None;
+        registry.create(input, "alice").expect("create");
+
         registry
-            .create(new_peer("wist-center"), "alice")
-            .expect("create");
-        registry
-            .report("wist-center", &["read".to_string()])
+            .report("wist-center", Some("https://h:3103"), &["read".to_string()])
             .expect("report");
         assert_eq!(
             registry.get("wist-center").unwrap().endpoint.as_deref(),
-            Some("https://wist-center.internal:19443/api/v1/internal/credentials")
+            Some("https://h:3103/api/v1/internal/credentials")
+        );
+
+        // 已有地址就不再覆盖（重跑接入命令不能把部署登记的值改掉）。
+        registry
+            .report(
+                "wist-center",
+                Some("https://other:1/api/v1/internal/credentials"),
+                &[],
+            )
+            .expect("report again");
+        assert_eq!(
+            registry.get("wist-center").unwrap().endpoint.as_deref(),
+            Some("https://h:3103/api/v1/internal/credentials")
         );
     }
 
@@ -1369,7 +1406,7 @@ mod tests {
             .expect("create");
 
         registry
-            .report("wist-ingest", &["read".to_string()])
+            .report("wist-ingest", None, &["read".to_string()])
             .expect("report");
         let peer = registry.get("wist-ingest").unwrap();
         assert_eq!(peer.roles, vec!["read"]);
@@ -1381,7 +1418,9 @@ mod tests {
         );
 
         // 空 = 这次没说，不能当清空。
-        registry.report("wist-ingest", &[]).expect("empty report");
+        registry
+            .report("wist-ingest", None, &[])
+            .expect("empty report");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
     }
 
@@ -1399,11 +1438,11 @@ mod tests {
     }
 
     #[test]
-    fn creating_without_an_endpoint_is_refused() {
-        // 没有地址的系统永远推不了、也探不了。建下来只会把错误推迟到接入那一刻。
+    fn creating_without_an_endpoint_leaves_it_pending() {
+        // 地址可以由自注册带进来；建的时候只给名字是合法的。
         let dir = TempDir::new();
         let registry = registry(&dir);
-        let err = registry
+        let peer = registry
             .create(
                 NewPeer {
                     name: "wist-ingest".to_string(),
@@ -1417,13 +1456,10 @@ mod tests {
                 },
                 "alice",
             )
-            .expect_err("endpoint is required");
-        assert!(
-            matches!(err, PeerError::BadRequest(_))
-                && err.to_string().contains("endpoint is required"),
-            "unexpected: {err}"
-        );
-        assert!(registry.is_empty(), "nothing must be persisted");
+            .expect("create");
+        assert!(peer.endpoint.is_none());
+        assert!(peer.probe_url().is_none());
+        assert_eq!(registry.health("wist-ingest"), Health::NoEndpoint);
     }
 
     #[test]
@@ -1564,17 +1600,19 @@ mod tests {
             .expect("create");
 
         registry
-            .report("wist-ingest", &["read".to_string()])
+            .report("wist-ingest", None, &["read".to_string()])
             .expect("report");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
 
         // 空 = 这次没说，不能当清空。
-        registry.report("wist-ingest", &[]).expect("report empty");
+        registry
+            .report("wist-ingest", None, &[])
+            .expect("report empty");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
 
         // 非法字符集：拒，且旧值不动。
         let error = registry
-            .report("wist-ingest", &["bad'role".to_string()])
+            .report("wist-ingest", None, &["bad'role".to_string()])
             .expect_err("must reject");
         assert!(format!("{error:#}").contains("role name"), "{error:#}");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
