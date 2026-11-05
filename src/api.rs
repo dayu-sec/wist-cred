@@ -3606,7 +3606,13 @@ mod tests {
             .with_signer()
             .with_peer("wist-ingest", "ingest.internal");
         let (status, body) = harness
-            .call("GET", "/enroll/wot_deadbeef/bundle", None, "127.0.0.1", None)
+            .call(
+                "GET",
+                "/enroll/wot_deadbeef/bundle",
+                None,
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(status, StatusCode::GONE, "{body}");
         assert_eq!(body["error"]["code"], "script_link_expired");
