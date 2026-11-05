@@ -884,6 +884,16 @@ async fn enroll_peer(
         .get(&target.name)
         .and_then(|item| item.endpoint.clone())
         .or_else(|| reported_endpoint.map(str::to_string));
+    // 上报值与已登记值不一致：以已登记为准（人工/种子优先），但要说出来——
+    // 这通常意味着“对端以为它在另一个地址上”，心跳马上会红。
+    if let (Some(reported), Some(stored)) = (reported_endpoint, effective_endpoint.as_deref())
+        && stored != reported
+    {
+        log::warn!(
+            "peer {} reported endpoint {reported:?} but keeps the registered {stored:?}",
+            target.name
+        );
+    }
 
     log::info!(
         "onboarding enrolled: peer={} host={} endpoint={:?} serial={} fingerprint={} not_after={} source={peer}",
@@ -3588,6 +3598,92 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "ticket was burnt: {issued}");
+    }
+
+    #[tokio::test]
+    async fn the_bundle_of_an_unknown_ticket_is_gone() {
+        let harness = Harness::new()
+            .with_signer()
+            .with_peer("wist-ingest", "ingest.internal");
+        let (status, body) = harness
+            .call("GET", "/enroll/wot_deadbeef/bundle", None, "127.0.0.1", None)
+            .await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error"]["code"], "script_link_expired");
+    }
+
+    #[tokio::test]
+    async fn enrollment_fills_the_host_and_endpoint_when_the_record_had_none() {
+        // 自注册的典型现场：先建一条只有名字的记录，地址与主机名随注册进来。
+        let harness = Harness::new().with_signer();
+        let (status, created) = harness
+            .call(
+                "POST",
+                "/api/v1/peers",
+                Some("alice"),
+                "127.0.0.1",
+                Some(json!({ "name": "wist-ingest" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+
+        let uri = mint_enroll_uri(&harness, "wist-ingest").await;
+        let (status, issued) = harness
+            .call(
+                "POST",
+                &uri,
+                None,
+                "127.0.0.1",
+                Some(json!({
+                    "certificate_signing_request": csr(),
+                    "host": "ingest.internal",
+                    "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{issued}");
+
+        let (_, listed) = harness
+            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .await;
+        assert_eq!(listed["peers"][0]["host"], "ingest.internal");
+        assert_eq!(
+            listed["peers"][0]["endpoint"],
+            "https://ingest.internal:19443/api/v1/internal/credentials"
+        );
+        // 地址补上之后就不再是 no_endpoint 了（还没探 → unknown）。
+        assert_eq!(listed["peers"][0]["health"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn a_reported_endpoint_never_overrides_a_registered_one() {
+        let harness = Harness::new()
+            .with_signer()
+            .with_peer("wist-ingest", "ingest.internal");
+        let uri = mint_enroll_uri(&harness, "wist-ingest").await;
+        let (status, issued) = harness
+            .call(
+                "POST",
+                &uri,
+                None,
+                "127.0.0.1",
+                Some(json!({
+                    "certificate_signing_request": csr(),
+                    // 主机名对得上（否则会被 invalid_enrollment 拒），但路径不同：
+                    // 已登记的部署值必须优先。
+                    "endpoint": "https://ingest.internal:19443/another/path"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{issued}");
+
+        let (_, listed) = harness
+            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .await;
+        assert_eq!(
+            listed["peers"][0]["endpoint"],
+            "https://ingest.internal:19443/api/v1/internal/credentials"
+        );
     }
 
     async fn mint_enroll_uri(harness: &Harness, peer: &str) -> String {

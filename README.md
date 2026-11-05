@@ -27,11 +27,12 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `POST /api/v1/credentials/{id}/revoke` | 撤销（幂等：重放不重复升 revision） |
 | `GET /api/v1/policy` | 签发策略：`max_ttl_seconds` / `break_glass_max_ttl_seconds`（页面用它把超限选项标出来） |
 | `GET /api/v1/peers` | 列出认证系统（含**心跳状态**：`no_endpoint` / `unknown` / `up`+延迟 / `down`+原因） |
-| `POST /api/v1/peers` | 新建认证系统（名称 + **收数地址，必填**）；落 `state/peers.json`，**不需重启** |
+| `POST /api/v1/peers` | 新建认证系统（名称必填，**收数地址可选**）；落 `state/peers.json`，**不需重启** |
 | `POST /api/v1/peers/{name}/endpoint` | 改收数地址（`null` = 撤销地址：随后不再探、不再推，也不能接入） |
 | `POST /api/v1/peers/{name}/setup` | 接入落点：要不要顺手写配置（`config_path`）/ 重启（`restart_cmd`） |
 | `POST /api/v1/peers/{name}/enrollment-tickets` | 签一张**一次性**接入券（默认 900s） |
 | `GET /enroll/{token}/join.sh` | 取出接入脚本（**只有公开材料 + 券，无任何私钥**） |
+| `GET /enroll/{token}/bundle` | 自注册用的公开材料：`client_ca_pem` / `issuer_signing_pub`（券授权、**不消耗**、可重复取） |
 | `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**，一次性） |
 | `GET /healthz` / `GET /version` | 探针 |
 
@@ -83,8 +84,9 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
 | `endpoint` 只给 `https://host:port`（没路径） | 落库时**自动补** `/api/v1/internal/credentials`（已有路径则原样保留，尾斜杠去掉） |
 | 认证系统有 `endpoint` 但推送失败 | `500 credential_delivery_pending`，**不给明文** |
 | 接入券重复兑现 / 过期 | `401 enrollment_rejected`（不区分原因） |
-| 建系统 / 接入时**没有登记收数地址** | `400 endpoint_required`（建系统、接入都拒）；接入侧**不消耗券**，补上地址后同一张券可用 |
-| 接入时还带 `endpoint` 字段 | `400 endpoint_not_accepted`：地址只由部署登记（页面 / `CRED_PKI_PEERS`），不走命令行 |
+| 建系统 / 接入时**没有登记收数地址** | `400 endpoint_required`（接入拒，**不消耗券**）：让对端自注册带上地址，或在页面/种子里补 |
+| 接入时上报的 `endpoint` | 接受，但**只在券校验通过后**，且只补空（人工/种子设过的优先） |
+| 上报的地址主机名 ≠ 证书 SAN | `400 invalid_enrollment`（不烧券）：cred 以后要往这个地址推、往这里探 |
 | 建的 `host` 与地址主机名不一致 | `400 invalid_peer`（证书 SAN 必须与推数时连的地址一致） |
 | 坏 CSR | `400 invalid_csr`，**不消耗券** |
 
