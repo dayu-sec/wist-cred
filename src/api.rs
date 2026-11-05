@@ -253,14 +253,15 @@ fn peer_view(peer: &Peer, health: &Health) -> Value {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePeerRequest {
-    /// 名称：页面显示、凭证的 audience、推数时的对端标识。**只要求这一个**。
+    /// 名称：页面显示、凭证的 audience、推数时的对端标识。
     name: String,
-    /// 可选：主机名（证书 SAN）。平常由对方登记时上报，这里只给脚本 / 迁移用。
+    /// **必填**：收数地址（`https://…`）。没有地址的系统既推不了也探不了，
+    /// 接入也会被拒 —— 所以不允许建一条空壳记录。
+    #[serde(default)]
+    endpoint: String,
+    /// 可选：主机名（证书 SAN）。不给就从地址里取。
     #[serde(default)]
     host: Option<String>,
-    /// 可选：收数地址（`https://…`）。平常也由对方上报。
-    #[serde(default)]
-    endpoint: Option<String>,
     /// 可选：心跳探测地址；缺省由 endpoint 推到同源 `/healthz`。
     #[serde(default)]
     healthz: Option<String>,
@@ -290,10 +291,21 @@ async fn create_peer(
         );
     }
 
+    // 没有地址就没有“往哪儿推 / 往哪儿探”，也不该允许接入：
+    // 建一条空壳只会把错误推迟到接入那一刻（甚至永远不露）。
+    if body.endpoint.trim().is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "endpoint_required",
+            "an ingest address is required (https://host:port/path): \
+             without it this system is never probed and never receives pushes",
+        );
+    }
+
     let input = NewPeer {
         name: body.name,
         host: body.host,
-        endpoint: body.endpoint,
+        endpoint: Some(body.endpoint),
         healthz: body.healthz,
         roles: body.roles,
         // 建的时候不填：接入落点是后续在页面上改的（与“只填名称”同一取向）。
@@ -341,12 +353,12 @@ async fn create_peer(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetEndpointRequest {
-    /// `null` / 空串 = 退回手工分发。
+    /// `null` / 空串 = **撤销地址**（随后不探、不推，也不能接入）。
     #[serde(default)]
     endpoint: Option<String>,
 }
 
-/// 改收数地址（或清空退回手工分发）。改完下一轮心跳就会去探新地址。
+/// 改收数地址（或清空 = 撤销）。改完下一轮心跳就会去探新地址。
 async fn set_peer_endpoint(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -614,10 +626,13 @@ fn client_ca_pem(config: &Config) -> Option<String> {
 struct EnrollRequest {
     /// X 本机生成的 CSR（PEM）。**只含公钥**，私钥永不上送。
     certificate_signing_request: String,
-    /// X 上报的证书 SAN（通常就是它的主机名）。不给则由 endpoint 推导。
+    /// X 上报的证书 SAN（通常就是它的主机名）。不给就用注册表里已登记的那个。
     #[serde(default)]
     host: Option<String>,
-    /// X 上报的收摘要地址。`None` / 空 = 只做手工分发。
+    /// **已废弃：收数地址不再由接入脚本上报。**
+    ///
+    /// 留着这个字段只为了**明着拒**：旧脚本 / 旧文档里的 `--advertise` 会带它过来，
+    /// 静默忽略等于让人以为“地址已经登记了”。改成由部署登记（页面 / `CRED_PKI_PEERS`）。
     #[serde(default)]
     endpoint: Option<String>,
     /// X 上报的**自己能验的角色**。上报非空就覆盖（重跑接入命令 = 改角色）；
@@ -693,23 +708,60 @@ async fn enroll_peer(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let reported_endpoint = body
+
+    // 旧脚本 / 旧文档可能还在传地址：**明着拒**。静默忽略会让人以为它生效了，
+    // 而地址其实没被登记 —— 正是这条路以前造成的“登记成功、永远收不到东西”。
+    if body
         .endpoint
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .is_some_and(|value| !value.is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "endpoint_not_accepted",
+            "the ingest address is not reported at enrollment any more: \
+             register it on the auth system (console page, or CRED_PKI_PEERS in the stack) \
+             and re-run the command without --advertise",
+        );
+    }
 
-    // 证书 SAN：上报的 > 已登记的 > 从地址推。三者都没有就签不了。
+    // 没有收数地址的系统不允许接入：证书发出去也永远收不到推送，
+    // 而且接入之后人看到的是“接好了”，真正的错要等好久才露头。
+    if target
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "endpoint_required",
+            format!(
+                "auth system {:?} has no ingest address yet; register it first \
+                 (console page, or CRED_PKI_PEERS in the stack) — the ticket is not consumed",
+                target.name
+            ),
+        );
+    }
+
+    // 证书 SAN：上报的 > 已登记的。两者都没有就签不了（地址不参与推导）。
+    // ③′ 上报值本身是否合法（主机名 / 角色）：**在兑现券之前**查，
+    // 否则一个拼错的主机名就把一整张一次性券烧掉了。
+    if let Err(reason) = crate::peers::validate_report(reported_host, &body.roles) {
+        return err(StatusCode::BAD_REQUEST, "invalid_enrollment", reason);
+    }
+
     let san = reported_host
         .map(str::to_string)
-        .or_else(|| target.host.clone())
-        .or_else(|| reported_endpoint.and_then(crate::peers::host_of));
+        .or_else(|| target.host.clone());
     let Some(san) = san else {
         return err(
             StatusCode::BAD_REQUEST,
             "host_required",
             "enrollment needs the host the certificate is for; \
-             pass --host or --advertise, or set the host on the auth system",
+             pass --host, or set the host on the auth system",
         );
     };
 
@@ -722,14 +774,6 @@ async fn enroll_peer(
             "host_mismatch",
             format!("this auth system is registered for {known:?}, but {san:?} was reported"),
         );
-    }
-
-    // ③′ 上报值本身是否合法（主机名 / 地址 / 角色）：**在兑现券之前**查，
-    // 否则一个拼错的主机名就把一整张一次性券烧掉了。
-    if let Err(reason) =
-        crate::peers::validate_report(reported_host, reported_endpoint, &body.roles)
-    {
-        return err(StatusCode::BAD_REQUEST, "invalid_enrollment", reason);
     }
 
     // ④ 兑现券（原子）。失败原因对外不可区分。
@@ -765,10 +809,7 @@ async fn enroll_peer(
     };
 
     // ⑦ 落对方上报的身份（只补空）。失败不影响签发 —— 证书已经给出去了。
-    if let Err(error) = state
-        .peers
-        .report(&target.name, Some(&san), reported_endpoint, &body.roles)
-    {
+    if let Err(error) = state.peers.report(&target.name, &body.roles) {
         log::warn!(
             "peer {:?} reported values were not persisted: {error:#}",
             target.name
@@ -779,7 +820,7 @@ async fn enroll_peer(
         "onboarding enrolled: peer={} host={} endpoint={:?} serial={} fingerprint={} not_after={} source={peer}",
         target.name,
         san,
-        reported_endpoint,
+        target.endpoint,
         issued.serial_hex,
         issued.fingerprint_sha256_hex,
         issued.not_after
@@ -1261,7 +1302,7 @@ async fn redeliver_credential(
 
     let target = state.peers.get(&record.audience);
     let endpoint = target.as_ref().and_then(|item| item.endpoint.clone());
-    // 没有地址 = 手工分发：先回答“往哪儿推”，再回答“能不能推”。
+    // 没有地址（已撤销）：先回答“往哪儿推”，再回答“能不能推”。
     let (Some(target), Some(endpoint)) = (target, endpoint) else {
         return err(
             StatusCode::CONFLICT,
@@ -1700,7 +1741,9 @@ mod tests {
             self
         }
 
-        /// 手工分发的认证系统：**没有收数地址**，所以签发不会去推。
+        /// 手工分发的认证系统：**地址被撤销**（建了再清），所以签发不会去推。
+        ///
+        /// 建的时候必须给地址（没有地址的系统不允许存在），撤销是一个**显式动作**。
         fn with_peer_manual(self, name: &str, host: &str, roles: &[&str]) -> Self {
             self.state
                 .peers
@@ -1708,7 +1751,7 @@ mod tests {
                     NewPeer {
                         name: name.to_string(),
                         host: Some(host.to_string()),
-                        endpoint: None,
+                        endpoint: Some(format!("https://{host}:19443/api/v1/internal/credentials")),
                         healthz: None,
                         roles: roles.iter().map(|role| (*role).to_string()).collect(),
                         config_path: None,
@@ -1718,6 +1761,7 @@ mod tests {
                     "test",
                 )
                 .expect("create peer");
+            self.state.peers.set_endpoint(name, None).expect("clear");
             self
         }
 
@@ -2408,7 +2452,7 @@ mod tests {
 
     #[tokio::test]
     async fn redeliver_names_the_missing_delivery_target_first() {
-        // 受众没有收数地址 = 手工分发：先说“往哪儿推”，不要先说“没有推送客户端”。
+        // 受众没有收数地址（已撤销）：先说“往哪儿推”，不要先说“没有推送客户端”。
         let harness = Harness::new().with_signer();
         harness
             .call(
@@ -2446,7 +2490,7 @@ mod tests {
 
     #[tokio::test]
     async fn redeliver_needs_a_push_client() {
-        // 先在“手工分发”状态签发，再把地址补上：这样 create 不会提前被 push_disabled 拦住。
+        // 先在“地址已撤销”状态签发，再把地址补上：这样 create 不会提前被 push_disabled 拦住。
         let harness = Harness::new().with_peer_manual(
             "wist-center",
             "center.internal",
@@ -2873,7 +2917,8 @@ mod tests {
         let harness = Harness::new().with_signer();
         let body = json!({
             "name": "wist-ingest",
-            "host": "ingest.internal"
+            "host": "ingest.internal",
+            "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
         });
         let (status, _) = harness
             .call(
@@ -2899,17 +2944,25 @@ mod tests {
         assert_eq!(created["name"], "wist-ingest");
         // 受众就是系统名，不再单独返回一个永远相同的字段。
         assert!(created.get("audience").is_none());
-        // 只给了名字、没给收数地址：这不是“还没探过”，而是一个要人处理的状态。
-        // 报成 unknown 会把“永远收不到推送”藏起来。
-        assert_eq!(created["health"], "no_endpoint");
-        assert!(
-            created["last_error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("收数地址"),
-            "no_endpoint must say what is missing: {created}"
-        );
+        assert_eq!(created["health"], "unknown");
         assert_eq!(created["created_by"], "alice");
+    }
+
+    #[tokio::test]
+    async fn creating_a_peer_without_an_endpoint_is_refused() {
+        // 没有地址的系统推不了也探不了：不能建下来。
+        let harness = Harness::new().with_signer();
+        let (status, body) = harness
+            .call(
+                "POST",
+                "/api/v1/peers",
+                Some("alice"),
+                "127.0.0.1",
+                Some(json!({ "name": "wist-ingest", "host": "ingest.internal" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["error"]["code"], "endpoint_required");
     }
 
     #[tokio::test]
@@ -2937,7 +2990,11 @@ mod tests {
     #[tokio::test]
     async fn creating_a_duplicate_peer_is_a_conflict() {
         let harness = Harness::new().with_signer();
-        let body = json!({ "name": "wist-ingest", "host": "ingest.internal" });
+        let body = json!({
+            "name": "wist-ingest",
+            "host": "ingest.internal",
+            "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+        });
         let (first, _) = harness
             .call(
                 "POST",
@@ -2970,7 +3027,7 @@ mod tests {
                 "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
-                Some(json!({ "name": "x", "host": "x.internal" })),
+                Some(json!({ "name": "x", "host": "x.internal", "endpoint": "https://x.internal:19443/x" })),
             )
             .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2986,7 +3043,11 @@ mod tests {
                 "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
-                Some(json!({ "name": "wist-ingest", "host": "ingest.internal" })),
+                Some(json!({
+                    "name": "wist-ingest",
+                    "host": "ingest.internal",
+                    "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+                })),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -3016,16 +3077,10 @@ mod tests {
             .with_peer("wist-ingest", "ingest.internal");
         let uri = mint_enroll_uri(&harness, "wist-ingest").await;
 
-        for (label, body) in [
-            (
-                "role",
-                json!({ "certificate_signing_request": csr(), "roles": ["bad'role"] }),
-            ),
-            (
-                "endpoint",
-                json!({ "certificate_signing_request": csr(), "endpoint": "https://x`id`/y" }),
-            ),
-        ] {
+        for (label, body) in [(
+            "role",
+            json!({ "certificate_signing_request": csr(), "roles": ["bad'role"] }),
+        )] {
             let (status, rejected) = harness
                 .call("POST", &uri, None, "127.0.0.1", Some(body))
                 .await;
@@ -3035,6 +3090,22 @@ mod tests {
                 "{label}: {rejected}"
             );
         }
+
+        // 旧脚本带来的地址参数：**明着拒**，券也不烧。
+        let (status, rejected) = harness
+            .call(
+                "POST",
+                &uri,
+                None,
+                "127.0.0.1",
+                Some(json!({
+                    "certificate_signing_request": csr(),
+                    "endpoint": "https://x`id`/y"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "endpoint_not_accepted");
 
         // 券仍然可用：同一张券还能换到证书。
         let (status, issued) = harness
@@ -3059,7 +3130,11 @@ mod tests {
                 "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
-                Some(json!({ "name": "wist-ingest", "roles": ["read"] })),
+                Some(json!({
+                    "name": "wist-ingest",
+                    "roles": ["read"],
+                    "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+                })),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -3117,9 +3192,12 @@ mod tests {
                 "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
-                Some(
-                    json!({ "name": "wist-ingest", "host": "ingest.internal", "roles": ["read"] }),
-                ),
+                Some(json!({
+                    "name": "wist-ingest",
+                    "host": "ingest.internal",
+                    "roles": ["read"],
+                    "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+                })),
             )
             .await;
         let (status, rejected) = harness
@@ -3136,13 +3214,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enroll_reports_an_endpoint_and_only_fills_the_empty_slot() {
+    async fn enroll_refuses_to_accept_an_endpoint_from_the_command() {
+        // 地址是部署登记的事实。接入时传过来一律拒，不静默忽略 ——
+        // 静默忽略会让人以为“地址已经登记了”。
         let harness = Harness::new()
             .with_signer()
             .with_peer("wist-ingest", "ingest.internal");
-        // with_peer 已经给了地址 → 上报的值不应覆盖。
         let uri = mint_enroll_uri(&harness, "wist-ingest").await;
-        let (status, _) = harness
+        let (status, rejected) = harness
             .call(
                 "POST",
                 &uri,
@@ -3154,7 +3233,9 @@ mod tests {
                 })),
             )
             .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "endpoint_not_accepted");
+        // 注册表里的地址一个字节都没变。
         let (_, listed) = harness
             .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
             .await;
@@ -3162,6 +3243,49 @@ mod tests {
             listed["peers"][0]["endpoint"],
             "https://ingest.internal:19443/api/v1/internal/credentials"
         );
+    }
+
+    #[tokio::test]
+    async fn enroll_is_refused_when_the_system_has_no_registered_address() {
+        // 地址被撤销的系统：不允许接入（券不烧），否则又是一条“永远收不到推送”。
+        let harness = Harness::new().with_signer().with_peer_manual(
+            "wist-ingest",
+            "ingest.internal",
+            &["read"],
+        );
+        let uri = mint_enroll_uri(&harness, "wist-ingest").await;
+        let (status, rejected) = harness
+            .call(
+                "POST",
+                &uri,
+                None,
+                "127.0.0.1",
+                Some(json!({ "certificate_signing_request": csr() })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "endpoint_required");
+
+        // 券没被烧：补上地址后同一张券能跑完。
+        harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-ingest/endpoint",
+                Some("alice"),
+                "127.0.0.1",
+                Some(json!({ "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials" })),
+            )
+            .await;
+        let (status, issued) = harness
+            .call(
+                "POST",
+                &uri,
+                None,
+                "127.0.0.1",
+                Some(json!({ "certificate_signing_request": csr() })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "ticket was burnt: {issued}");
     }
 
     #[tokio::test]
@@ -3255,8 +3379,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enroll_accepts_the_host_and_endpoint_the_peer_reports() {
-        // 建的时候只给名字（页面上就是这样），身份靠登记时上报。
+    async fn enroll_accepts_the_host_the_peer_reports() {
+        // 建的时候就要给地址（身份由它推出）；接入时对方再报一次自己的主机名，必须对得上。
         let harness = Harness::new().with_signer();
         let (status, created) = harness
             .call(
@@ -3264,14 +3388,14 @@ mod tests {
                 "/api/v1/peers",
                 Some("alice"),
                 "127.0.0.1",
-                Some(json!({ "name": "wist-ingest" })),
+                Some(json!({
+                    "name": "wist-ingest",
+                    "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+                })),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "body: {created}");
-        assert!(
-            created["host"].is_null(),
-            "host must be unknown before enrol"
-        );
+        assert_eq!(created["host"], "ingest.internal");
 
         let uri = mint_enroll_uri(&harness, "wist-ingest").await;
         let (status, issued) = harness
@@ -3282,8 +3406,7 @@ mod tests {
                 "127.0.0.1",
                 Some(json!({
                     "certificate_signing_request": csr(),
-                    "host": "ingest.internal",
-                    "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+                    "host": "ingest.internal"
                 })),
             )
             .await;
@@ -3302,44 +3425,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn enrol_without_any_host_is_rejected_and_does_not_burn_the_ticket() {
-        let harness = Harness::new().with_signer();
-        let (_, _) = harness
-            .call(
-                "POST",
-                "/api/v1/peers",
-                Some("alice"),
-                "127.0.0.1",
-                Some(json!({ "name": "wist-ingest" })),
-            )
-            .await;
-        let uri = mint_enroll_uri(&harness, "wist-ingest").await;
-
-        let (status, body) = harness
-            .call(
-                "POST",
-                &uri,
-                None,
-                "127.0.0.1",
-                Some(json!({ "certificate_signing_request": csr() })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "host_required");
-
-        // 券还在：补上 host 就能登记。
-        let (status, _) = harness
-            .call(
-                "POST",
-                &uri,
-                None,
-                "127.0.0.1",
-                Some(json!({ "certificate_signing_request": csr(), "host": "ingest.internal" })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK);
-    }
+    // （“没 host”已不可能发生：建系统必须有地址，host 由地址推出；种子里 host 必填。）
 
     #[tokio::test]
     async fn a_reported_host_that_disagrees_with_the_registered_one_is_rejected() {

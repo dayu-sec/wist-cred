@@ -132,10 +132,6 @@ pub fn render_script(
         .replace("__PEER_NAME__", &shell_single_quoted(&peer.name))
         .replace("__PEER_HOST__", &shell_single_quoted(peer.host()))
         .replace(
-            "__PEER_ENDPOINT__",
-            &shell_single_quoted(peer.endpoint.as_deref().unwrap_or("")),
-        )
-        .replace(
             "__PEER_ROLES__",
             &shell_single_quoted(&peer.roles.join(",")),
         )
@@ -338,11 +334,12 @@ mod tests {
         assert!(script.contains("PEER_HOST='ingest.internal'"));
         // 受众写进 cred.toml（不再是个裸 shell 变量）。
         assert!(script.contains("audience        = \"wist-ingest\""));
+        // 收数地址**不进脚本**：它是部署登记的事实，不是在对方机器上传的参数。
         assert!(
-            script.contains(
-                "PEER_ENDPOINT='https://ingest.internal:19443/api/v1/internal/credentials'"
-            )
+            !script.contains("ingest.internal:19443"),
+            "the ingest address must not travel with the command"
         );
+        assert!(!script.contains("--advertise"));
         assert!(script.contains("ENROLL_URL='https://cred.internal/onboarding/enroll/wot_x'"));
         assert!(script.contains("-----BEGIN CERTIFICATE-----"));
         assert!(!script.contains("__PEER_NAME__"), "placeholder left behind");
@@ -736,8 +733,8 @@ mod tests {
             "role quote must be escaped, got: {script}"
         );
         assert!(
-            script.contains(r"PEER_ENDPOINT='https://ingest.internal:19443/x'\''y'"),
-            "endpoint quote must be escaped, got: {script}"
+            !script.contains("x'y"),
+            "the endpoint must not be embedded at all, got: {script}"
         );
     }
 

@@ -30,6 +30,8 @@ struct Harness {
     addr: SocketAddr,
     dir: PathBuf,
     boarding: Arc<TicketStore>,
+    /// 注册表句柄：用例要能改地址（例如撤销后再补上）。
+    peers: Arc<PeerRegistry>,
 }
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -42,20 +44,15 @@ fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// 起一个真 cred：真实 CA（测试里现场生成）、一个已登记的认证系统。
+/// 起一个真 cred：真实 CA（测试里现场生成）、一个已登记的认证系统（**带收数地址**）。
 async fn start(tag: &str) -> Harness {
-    start_with(
-        tag,
-        Some("https://center.internal:19443/api/v1/internal/credentials".to_string()),
-    )
-    .await
+    start_with(tag, true).await
 }
 
-/// 同 `start`，但可以决定这个认证系统**有没有收数地址**。
+/// 同 `start`，但可以决定这个认证系统**地址还在不在**。
 ///
-/// 没地址是新接入最容易踩的坑：脚本能跑、登记也“成功”，但 cred 永远不会探它、
-/// 也不会给它推送 —— 所以脚本默认拒绝，必须显式 `--manual`。
-async fn start_with(tag: &str, endpoint: Option<String>) -> Harness {
+/// 没地址 = 推不了也探不了；接入会被拒（券不烧），而不是“登记成功、永远收不到东西”。
+async fn start_with(tag: &str, with_endpoint: bool) -> Harness {
     let dir = unique_dir(tag);
 
     // CA-S：签发 X 的服务器证书。同一张证书也当 CA-I 的信任锚下发（测试里够用）。
@@ -107,7 +104,9 @@ async fn start_with(tag: &str, endpoint: Option<String>) -> Harness {
             NewPeer {
                 name: "wist-center".to_string(),
                 host: Some("center.internal".to_string()),
-                endpoint,
+                endpoint: Some(
+                    "https://center.internal:19443/api/v1/internal/credentials".to_string(),
+                ),
                 healthz: None,
                 roles: vec!["admin".to_string(), "read".to_string()],
                 install_dir: None,
@@ -119,13 +118,17 @@ async fn start_with(tag: &str, endpoint: Option<String>) -> Harness {
         .expect("create peer");
 
     let boarding = Arc::new(TicketStore::new(config.onboarding.script_ttl_seconds));
+    if !with_endpoint {
+        // 地址是建的时候必填的；"没有地址"只能是一个**显式撤销**后的状态。
+        peers.set_endpoint("wist-center", None).expect("clear");
+    }
     let state = AppState {
         config: Arc::new(config),
         store: Arc::new(Store::open(dir.join("credentials.db")).expect("store")),
         push: None,
         boarding: boarding.clone(),
         signer: Some(Arc::new(authority)),
-        peers,
+        peers: peers.clone(),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -142,6 +145,7 @@ async fn start_with(tag: &str, endpoint: Option<String>) -> Harness {
         addr,
         dir,
         boarding,
+        peers,
     }
 }
 
@@ -385,11 +389,11 @@ async fn config_outside_the_material_dir_is_refused() {
 
 /// 「注册成功了，但什么都不动」—— 之前就是这样把错藏起来的。
 ///
-/// 没有收数地址的 peer：脚本能跑、登记也能成功，但 cred 永远不会探它，
-/// 也不会给它推送凭据。所以默认拒跑，要退化必须 `--manual`，并且把后果说出来。
+/// 地址被撤销的系统：脚本跑得下去，但登记会被拒（`endpoint_required`），
+/// 券不烧；把地址补回去后，同一张券能接着跑。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_without_an_endpoint_is_refused_unless_manual() {
-    let harness = start_with("no-endpoint", None).await;
+async fn enrollment_is_refused_when_no_address_is_registered() {
+    let harness = start_with("no-endpoint", false).await;
     let script = harness.fetch_script(&harness.dir.join("join.sh"));
     let material = harness.dir.join("materials");
 
@@ -399,51 +403,58 @@ async fn a_peer_without_an_endpoint_is_refused_unless_manual() {
         &["--dir", material.to_str().unwrap()],
     );
     let text = stdout_of(&out);
-    assert!(!out.status.success(), "没地址时必须拒跑：\n{text}");
-    assert!(text.contains("--advertise"), "要给出补救办法：\n{text}");
-    assert!(text.contains("--manual"), "要给出显式退化的办法：\n{text}");
+    assert!(!out.status.success(), "没地址时必须拒：\n{text}");
+    // 脚本把 cred 的拒绝翻成一句能处理的话（而不是只回显后端原文）。
+    assert!(text.contains("收数地址"), "要明说缺什么：\n{text}");
     assert!(
         !material.join("cred.toml").exists(),
-        "拒跑时不能落下半套材料：\n{text}"
+        "拒时必须不落材料：\n{text}"
     );
 
-    // 券没被烧掉：同一张券加上 --manual 还能跑完，并且结果被明说。
+    // 管理员在控制台补上地址；同一张券后仍可用。
+    harness
+        .peers
+        .set_endpoint(
+            "wist-center",
+            Some("https://center.internal:19443/api/v1/internal/credentials"),
+        )
+        .expect("set endpoint");
     let out = Harness::run_script(
         &harness.dir,
         &script,
-        &["--dir", material.to_str().unwrap(), "--manual"],
+        &["--dir", material.to_str().unwrap()],
     );
     let text = stdout_of(&out);
-    assert!(out.status.success(), "--manual 应当允许跑完：\n{text}");
-    assert!(text.contains("手工分发模式"), "要明说后果：\n{text}");
-    assert!(text.contains("不会收到推送"), "{text}");
-    assert!(material.join("cred.toml").is_file(), "{text}");
+    assert!(out.status.success(), "补上地址后应当跑通：\n{text}");
+    assert!(text.contains("▶ 完成"), "{text}");
 }
 
-/// 显式给了 `--advertise` 时，地址必须被登记（不能只写进脚本就当完事）。
+/// 接入命令里**不能有任何收数地址**：地址是部署登记的事实，不是命令行参数。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn advertise_without_a_baked_endpoint_is_actually_reported() {
-    let harness = start_with("advertise", None).await;
+async fn the_command_carries_no_address_and_keeps_the_registered_one() {
+    let harness = start("no-address-in-command").await;
     let script = harness.fetch_script(&harness.dir.join("join.sh"));
     let material = harness.dir.join("materials");
 
+    let text = std::fs::read_to_string(&script).expect("read join.sh");
+    assert!(
+        !text.contains("center.internal:19443"),
+        "收数地址不该随命令下发：\n{text}"
+    );
+    assert!(!text.contains("--advertise"), "{text}");
+
     let out = Harness::run_script(
         &harness.dir,
         &script,
-        &[
-            "--dir",
-            material.to_str().unwrap(),
-            "--advertise",
-            "https://center.internal:19443/api/v1/internal/credentials",
-        ],
+        &["--dir", material.to_str().unwrap()],
     );
     let text = stdout_of(&out);
     assert!(out.status.success(), "应当跑通：\n{text}");
-    assert!(text.contains("▶ 完成"), "{text}");
 
+    // 注册表里的地址一个字节没变（既没被清，也没被覆盖）。
     let stored = std::fs::read_to_string(harness.dir.join("peers.json")).expect("peers.json");
     assert!(
         stored.contains("https://center.internal:19443/api/v1/internal/credentials"),
-        "收数地址没被登记：\n{stored}"
+        "登记不该改动已登记的地址：\n{stored}"
     );
 }

@@ -19,10 +19,10 @@
 set -euo pipefail
 
 PEER_NAME='__PEER_NAME__'
-# 名字是操作者给的。下面两个是**本机自己知道的东西**，默认从内嵌值起头、
-# 可以被 --host / --advertise 覆盖，没给就自己算（见下面“确定身份”）。
+# 名字是操作者给的。证书 SAN 可以在这里起头、被 --host 覆盖，
+# 没给就自己算（见下面“确定身份”）。
+# **收数地址不在这里**：它是部署登记的事实（页面 / 部署栈），不由接入脚本上报。
 PEER_HOST='__PEER_HOST__'
-PEER_ENDPOINT='__PEER_ENDPOINT__'
 # 本机能验的角色（逗号分隔）：登记时上报，之后发凭证只能从这里选。
 PEER_ROLES='__PEER_ROLES__'
 ENROLL_URL='__ENROLL_URL__'
@@ -36,10 +36,6 @@ INSTALL_DIR="${WIST_CRED_INSTALL_DIR:-__INSTALL_DIR__}"
 CONFIG_FILE="${WIST_CRED_CONFIG_FILE:-__CONFIG_FILE__}"
 RESTART_CMD="${WIST_CRED_RESTART_CMD:-__RESTART_CMD__}"
 CA_CERT=""
-# 手工分发模式：**必须显式选择**（`--manual`）。
-# 没有收数地址的 peer 会被心跳跳过、永远收不到推送，而现场看上去只是“什么都没发生”，
-# 所以默认拒绝，要退化就得说出口。
-MANUAL=0
 
 say()  { printf '  %s\n' "$*"; }
 step() { printf '\n▶ %s\n' "$*"; }
@@ -69,10 +65,7 @@ usage() {
   --restart <cmd>   落盘后执行的重启命令（例如 'gops run stop && gops run start'）
   --cacert <pem>    校验签发方 TLS 的 CA（默认 -k，见下）
   --endpoint <url>  覆盖内嵌的登记地址（入口换了地址时用）
-  --host <fqdn>     证书 SAN（默认从 --advertise 推导，否则用本机 hostname -f）
-  --advertise <url> 本机收摘要的地址（登记时报给 cred）。**必填**：
-                    不给就不会被探活、也永远收不到推送
-  --manual          显式接受“没有收数地址”：只做人工分发（不探活、不推送）
+  --host <fqdn>     证书 SAN（默认本机 hostname -f）
   --roles <a,b>     本机能验的角色（逗号分隔）；之后对方只能从这些里选
                     重跑本脚本会**覆盖**对方那边的角色表（空 = 不改）
   -h, --help        显示本帮助
@@ -106,8 +99,6 @@ while [[ $# -gt 0 ]]; do
     --cacert)   [[ $# -ge 2 ]] || die "--cacert 需要一个值（PEM 路径）";    CA_CERT="$2"; shift 2 ;;
     --endpoint) [[ $# -ge 2 ]] || die "--endpoint 需要一个值（登记地址）";  ENROLL_URL="$2"; shift 2 ;;
     --host)     [[ $# -ge 2 ]] || die "--host 需要一个值（证书 SAN）";      PEER_HOST="$2"; shift 2 ;;
-    --advertise) [[ $# -ge 2 ]] || die "--advertise 需要一个值（收数地址）"; PEER_ENDPOINT="$2"; shift 2 ;;
-    --manual)   MANUAL=1; shift ;;
     --roles)    [[ $# -ge 2 ]] || die "--roles 需要一个值（逗号分隔，如 admin,read）";     PEER_ROLES="$2"; shift 2 ;;
     -h|--help)  usage; finished=1; exit 0 ;;
     *)          die "未知参数：${1}（-h 看用法）" ;;
@@ -176,34 +167,16 @@ fi
   || die "材料目录不可写：${INSTALL_DIR}（用 --dir 指到可写目录，或该目录换个属主）"
 say "openssl ✓   curl ✓   材料目录 ${INSTALL_DIR} ✓"
 
-# ── 确定身份：主机名（证书 SAN）与收数地址 ────────────────────────
+# ── 确定身份：主机名（证书 SAN）──────────────────────────────────
 step "确定本机身份"
 # 受众就是系统名，不另外问。
-if [[ -z "$PEER_HOST" && -n "$PEER_ENDPOINT" ]]; then
-  PEER_HOST="$(printf '%s' "$PEER_ENDPOINT" | sed -e 's#^https://##' -e 's#[/:].*##')"
-fi
+# 收数地址不在这里：它在部署时就登记好了（页面 / CRED_PKI_PEERS），
+# 拿它当命令行参数只会得到“看起来能推、其实不通”的地址。
 if [[ -z "$PEER_HOST" ]]; then
   PEER_HOST="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
 fi
 [[ -n "$PEER_HOST" ]] || die "无法确定主机名，请用 --host 指定"
 say "证书 SAN：${PEER_HOST}"
-if [[ -z "$PEER_ENDPOINT" ]]; then
-  # 不默认退化：没地址 = cred 不会探、也不会推，凭据发了也送不到。
-  if [[ "$MANUAL" != "1" ]]; then
-    die "缺少收数地址（--advertise）。
-  cred 靠它探活、也靠它推送凭据；没有地址时这个系统会永远停在“未探测”，
-  凭据签发了也不会送达。
-  给出地址：  bash -s -- --advertise https://${PEER_HOST}:<端口>/<推送路径>
-  确实只要人工分发（不探活、不推送）：bash -s -- --manual"
-  fi
-  printf '\n  ⚠ 手工分发模式（--manual）：不会探活，也不会收到推送。\n'
-  printf '    凭据只能在页面上下载后人工转发；要恢复推送请到「认证系统」补收数地址并重新接入。\n\n'
-fi
-if [[ -n "$PEER_ENDPOINT" ]]; then
-  say "收数地址：${PEER_ENDPOINT}"
-else
-  say "收数地址：未上报（手工分发模式）"
-fi
 if [[ -n "$PEER_ROLES" ]]; then
   say "可验角色：${PEER_ROLES}"
 else
@@ -280,11 +253,7 @@ if [[ -n "$PEER_ROLES" ]]; then
   roles_json="[${roles_json}]"
 fi
 
-if [[ -n "$PEER_ENDPOINT" ]]; then
-  payload="{\"certificate_signing_request\":\"${csr_escaped}\",\"host\":\"${PEER_HOST}\",\"endpoint\":\"${PEER_ENDPOINT}\",\"roles\":${roles_json}}"
-else
-  payload="{\"certificate_signing_request\":\"${csr_escaped}\",\"host\":\"${PEER_HOST}\",\"roles\":${roles_json}}"
-fi
+payload="{\"certificate_signing_request\":\"${csr_escaped}\",\"host\":\"${PEER_HOST}\",\"roles\":${roles_json}}"
 
 http_code="$(curl -sS "${TLS_OPTS[@]}" -X POST "$ENROLL_URL" \
   -H 'accept: application/x-pem-file' \
@@ -296,6 +265,12 @@ if [[ "$http_code" != "200" ]]; then
   printf '\n  签发方返回 HTTP %s：\n\n' "$http_code" >&2
   sed 's/^/    /' "$tmp_body" >&2 || true
   echo >&2
+  # 最常见的两种拒绝分开说：没登记地址（管理员可修，券还在）与券用过了。
+  if grep -q 'endpoint_required' "$tmp_body" 2>/dev/null; then
+    die "登记被拒：这个认证系统还没有登记**收数地址**。
+  让管理员在控制台「认证系统」里给它补上（部署栈里是 CRED_PKI_PEERS 的第三个字段），
+  再重跑本命令 —— 券没有作废。"
+  fi
   die "登记失败。若提示券已用过，请让管理员重新生成一条接入命令。"
 fi
 

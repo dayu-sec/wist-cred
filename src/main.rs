@@ -160,7 +160,7 @@ async fn heartbeat_loop(pusher: Arc<Pusher>, peers: Arc<PeerRegistry>, seconds: 
         ticker.tick().await;
         for peer in peers.list() {
             let Some(url) = peer.probe_url() else {
-                // 没配地址 = 手工分发模式，不探。但这**不是正常状态**：
+                // 没地址（已撤销）就不探。但这**不是正常状态**：
                 // 它意味着永远收不到推送，所以要显式警告一次。
                 if warned.insert(peer.name.clone()) {
                     log::warn!(

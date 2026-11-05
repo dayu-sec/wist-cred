@@ -53,7 +53,7 @@ signing_key = "/etc/wist/cred/signing.key"
 # ── 推送：一套身份，所有认证系统共用 ────────────────────────────────────
 # 两个方向不是同一把 CA：client_* 由 CA-I 签（证明"我是 cred"），
 # ca 是 CA-S 信任锚（校 X 的服务器证书）。
-# 没有这一段 = 不推送（全靠手工分发），心跳也不会跑。
+# 没有这一段 = 不推送，心跳也不会跑（心跳要用这把客户端证书去握手）。
 #
 # [push]
 # client_cert = "/etc/wist/cred/client.crt"
