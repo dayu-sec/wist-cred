@@ -1975,6 +1975,7 @@ mod tests {
         assert!(!endpoints.is_empty());
         // 自述清单得与实际路由同源：漏一条就在自助排障时多一次“真的没这个接口吗”。
         for route in [
+            "GET  /api/v1/version",
             "GET  /api/v1/credentials",
             "POST /api/v1/credentials",
             "POST /api/v1/credentials/{id}/revoke",
@@ -1994,6 +1995,27 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ok");
+    }
+
+    /// 页面右上角的三个版本号要能在“还没登录”时答出来（与 `/healthz` 同一口径）：
+    /// `token` 模式下**不带口令**也必须 200 —— 否则刷新页面时那一行永远是 `—`。
+    #[tokio::test]
+    async fn version_endpoint_answers_without_a_password() {
+        let harness = Harness::new_token("page-password");
+
+        let (status, body) = harness
+            .call("GET", "/api/v1/version", None, "127.0.0.1", None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["name"], "wist-cred");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        // `stack_version` 只在真读到栈的 `version.txt` 时返回：要么缺省，要么非空字符串，
+        // 不能是 `null` / 空串（那是“编了个值”，页面会把它显示成版本号）。
+        match body.get("stack_version") {
+            None => {}
+            Some(Value::String(value)) => assert!(!value.trim().is_empty(), "{body}"),
+            other => panic!("unexpected stack_version: {other:?}"),
+        }
     }
 
     #[tokio::test]
