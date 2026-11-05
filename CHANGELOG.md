@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.2-alpha] - 2026-11-06
+
+### 新增：公开的 `GET /api/v1/version`（页面右上角的三个版本号）
+
+- 返回 `{name, version, stack_version?}`：`version` 是二进制（`CARGO_PKG_VERSION`）；
+  `stack_version` 读部署栈的 `version.txt` —— 环境变量 `WIST_CRED_STACK_VERSION` 优先，
+  其次 `WIST_CRED_STACK_VERSION_FILE`（默认 `/config/stack-version.txt`），与网关同一套取值规则。
+- **无鉴权**（与 `/healthz`、`/version` 同一口径）：页面要答“我连的是哪版”，
+  挂在口令后面反而答不出来；响应不含凭据、也不含业务数据。
+- 读不到栈版本就**不返回**该字段（页面显示 `—`），不编值；老的 `/version` 探针保持不变。
+
+### 变更：签发接入券时**单独**返回 `ticket`
+
+- `POST /api/v1/peers/{name}/enrollment-tickets` 的响应多一个 `ticket`（与 `path`
+  `/enroll/<券>/join.sh` 里的是同一个券）。自注册要的是券本身，之前只能从 `path` 里抠字符串
+  —— 等于把展示格式当契约用；页面也就只能给一整行命令，让人自己找券。
+- `path` 保持不变，旧调用方无感；该接口本来就在操作者认证后面，不新增暴露面。
+
 ## [0.6.1-alpha] - 2026-11-05
 
 ### 文档
