@@ -35,6 +35,7 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `GET /enroll/{token}/bundle` | 自注册用的公开材料：`client_ca_pem` / `issuer_signing_pub`（券授权、**不消耗**、可重复取） |
 | `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**，一次性） |
 | `GET /healthz` / `GET /version` | 探针 |
+| `GET /api/v1/version` | 版本探针（**无鉴权**）：`name` / `version`（本二进制）+ `stack_version`（部署栈的 `version.txt`，读不到就不返回）；页面右上角三个版本号用它 |
 
 ### 创建
 
