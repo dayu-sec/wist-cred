@@ -13,3 +13,4 @@ pub mod onboarding;
 pub mod peers;
 pub mod push;
 pub mod store;
+pub mod version;

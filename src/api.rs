@@ -78,6 +78,9 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(landing))
         .route("/healthz", get(healthz))
         .route("/version", get(version))
+        // 页面右上角的三个版本号（页面 / 凭据服务 / 部署栈）：公开、无鉴权，
+        // 与 /version 同一条口径；stack_version 由栈把 version.txt 挂进来。
+        .route("/api/v1/version", get(crate::version::cred_version))
         .route(
             "/api/v1/credentials",
             get(list_credentials).post(create_credential),
@@ -155,6 +158,7 @@ async fn landing() -> impl IntoResponse {
         "endpoints": [
             "GET  /healthz",
             "GET  /version",
+            "GET  /api/v1/version",
             "GET  /api/v1/credentials",
             "POST /api/v1/credentials",
             "GET  /api/v1/credentials/{id}",
@@ -169,8 +173,9 @@ async fn landing() -> impl IntoResponse {
             "POST /enroll/{token}/certificate",
         ],
         "auth": "requests under /api/v1 need `Authorization: Bearer <password>` in token mode \
-                 (the page asks for it), or the operator header injected by the ingress in ingress mode; \
-                 /enroll/{token}/{join.sh,certificate} are authorised by the one-time ticket itself \
+                 (the page asks for it), or the operator header injected by the ingress in ingress mode \
+                 — except GET /api/v1/version (probe: no credentials) and the /enroll/{token}/… family, \
+                 which is authorised by the one-time ticket itself \
                  (join.sh: re-fetchable, certificate: single use)",
     }))
 }
