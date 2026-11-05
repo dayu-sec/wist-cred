@@ -871,7 +871,7 @@ async fn enroll_peer(
     // ⑦ 落对方上报的身份（地址只补空；角色非空即覆盖）。失败不影响签发 —— 证书已经给出去了。
     if let Err(error) = state
         .peers
-        .report(&target.name, reported_endpoint, &body.roles)
+        .report(&target.name, Some(&san), reported_endpoint, &body.roles)
     {
         log::warn!(
             "peer {:?} reported values were not persisted: {error:#}",

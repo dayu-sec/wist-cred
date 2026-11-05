@@ -428,29 +428,36 @@ impl PeerRegistry {
         Ok(peer)
     }
 
-    /// 登记时接收对方上报的身份：`endpoint`（收数地址）与 `roles`。
+    /// 登记时接收对方上报的身份：`host`（证书 SAN）、`endpoint`（收数地址）、`roles`。
     ///
     /// 为什么这里能收地址：它只能随一张**一次性券**提交（`enroll` 兑现券后才调到这里），
     /// 而 `--advertise` 是未授权命令通道上的任意字符串 —— 两者不是一回事。
     ///
     /// 规则：
-    /// - `endpoint` **只补空**（人工/种子设过的值优先），并归一化成完整收数路径；
+    /// - `host` / `endpoint` **只补空**（人工/种子设过的值优先）；
+    /// - `endpoint` 归一化成完整收数路径；
     /// - `roles` **上报非空就覆盖**：它是 X 自己的词汇表，重跑接入命令就是改它；
     ///   上报空值只是“这次没说”，不当成清空。
     pub fn report(
         &self,
         name: &str,
+        host: Option<&str>,
         endpoint: Option<&str>,
         roles: &[String],
     ) -> anyhow::Result<()> {
+        let host = host.map(str::trim).filter(|value| !value.is_empty());
         let endpoint = endpoint.map(str::trim).filter(|value| !value.is_empty());
-        validate_report(None, endpoint, roles).map_err(anyhow::Error::msg)?;
+        validate_report(host, endpoint, roles).map_err(anyhow::Error::msg)?;
 
         let mut state = self.lock();
         let Some(peer) = state.peers.get_mut(name) else {
             return Ok(());
         };
         let mut changed = false;
+        if peer.host.is_none() {
+            peer.host = host.map(str::to_string);
+            changed |= peer.host.is_some();
+        }
         if peer.endpoint.is_none() {
             // 上报值也要归一化：只给 origin 时补默认收数路径。
             peer.endpoint = endpoint
@@ -1204,7 +1211,12 @@ mod tests {
         registry.create(input, "alice").expect("create");
 
         registry
-            .report("wist-center", Some("https://h:3103"), &["read".to_string()])
+            .report(
+                "wist-center",
+                None,
+                Some("https://h:3103"),
+                &["read".to_string()],
+            )
             .expect("report");
         assert_eq!(
             registry.get("wist-center").unwrap().endpoint.as_deref(),
@@ -1215,6 +1227,7 @@ mod tests {
         registry
             .report(
                 "wist-center",
+                None,
                 Some("https://other:1/api/v1/internal/credentials"),
                 &[],
             )
@@ -1406,7 +1419,7 @@ mod tests {
             .expect("create");
 
         registry
-            .report("wist-ingest", None, &["read".to_string()])
+            .report("wist-ingest", None, None, &["read".to_string()])
             .expect("report");
         let peer = registry.get("wist-ingest").unwrap();
         assert_eq!(peer.roles, vec!["read"]);
@@ -1419,7 +1432,7 @@ mod tests {
 
         // 空 = 这次没说，不能当清空。
         registry
-            .report("wist-ingest", None, &[])
+            .report("wist-ingest", None, None, &[])
             .expect("empty report");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
     }
@@ -1600,19 +1613,19 @@ mod tests {
             .expect("create");
 
         registry
-            .report("wist-ingest", None, &["read".to_string()])
+            .report("wist-ingest", None, None, &["read".to_string()])
             .expect("report");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
 
         // 空 = 这次没说，不能当清空。
         registry
-            .report("wist-ingest", None, &[])
+            .report("wist-ingest", None, None, &[])
             .expect("report empty");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
 
         // 非法字符集：拒，且旧值不动。
         let error = registry
-            .report("wist-ingest", None, &["bad'role".to_string()])
+            .report("wist-ingest", None, None, &["bad'role".to_string()])
             .expect_err("must reject");
         assert!(format!("{error:#}").contains("role name"), "{error:#}");
         assert_eq!(registry.get("wist-ingest").unwrap().roles, vec!["read"]);
