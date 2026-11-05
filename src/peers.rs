@@ -108,12 +108,23 @@ pub fn origin_of(url: &str) -> Option<String> {
     }
 }
 
-/// 心跳状态。**只活在内存里**。
+/// 心跳状态。**只活在内存里**（`NoEndpoint` 除外 —— 它是从注册表推导出来的事实）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
+    /// 这个系统**根本没有收数地址**：永远不会被探、也永远不会收到推送。
+    ///
+    /// 与 `Unknown`（刚启动 / 还没探过）是两件事：这个状态不会自己变好，
+    /// 必须有人把地址补上（`POST /api/v1/peers/{name}/endpoint`，或在接入时给 `--advertise`）。
+    NoEndpoint,
     Unknown,
-    Up { at: i64, latency_ms: u64 },
-    Down { at: i64, error: String },
+    Up {
+        at: i64,
+        latency_ms: u64,
+    },
+    Down {
+        at: i64,
+        error: String,
+    },
 }
 
 impl Health {
@@ -313,11 +324,21 @@ impl PeerRegistry {
     }
 
     pub fn health(&self, name: &str) -> Health {
-        self.lock()
-            .health
-            .get(name)
-            .cloned()
-            .unwrap_or(Health::Unknown)
+        let peers = self.lock();
+        // 「没有收数地址」不是“还没探过”，而是一个**永远不会自愈**的状态：
+        // 探针会直接跳过它。所以要单独说出来，不能让它一直显示成 unknown。
+        if let Some(peer) = peers.peers.get(name) {
+            let no_endpoint = peer
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty();
+            if no_endpoint {
+                return Health::NoEndpoint;
+            }
+        }
+        peers.health.get(name).cloned().unwrap_or(Health::Unknown)
     }
 
     pub fn set_health(&self, name: &str, health: Health) {
@@ -1504,6 +1525,31 @@ mod tests {
             peer.probe_url().as_deref(),
             Some("https://ingest.internal:19443/healthz")
         );
+    }
+
+    #[test]
+    fn a_peer_without_an_endpoint_reports_no_endpoint_not_unknown() {
+        // 没地址的 peer 永远不会被心跳看到。报 unknown 会让页面说“未探测”，
+        // 而实际是“永远不会被探测”—— 这就是之前被藏起来的那个错。
+        let dir = TempDir::new();
+        let registry = registry(&dir);
+        let mut input = new_peer("wist-ingest");
+        input.endpoint = None;
+        registry.create(input, "alice").expect("create");
+        assert_eq!(registry.health("wist-ingest"), Health::NoEndpoint);
+
+        // 补上地址就回到普通的一生：先是没探过，然后才可能 up/down。
+        registry
+            .set_endpoint(
+                "wist-ingest",
+                Some("https://ingest.internal:19443/api/v1/internal/credentials"),
+            )
+            .expect("set");
+        assert_eq!(registry.health("wist-ingest"), Health::Unknown);
+
+        // 再次清空又回到不可探。
+        registry.set_endpoint("wist-ingest", None).expect("clear");
+        assert_eq!(registry.health("wist-ingest"), Health::NoEndpoint);
     }
 
     #[test]

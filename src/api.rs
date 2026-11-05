@@ -215,6 +215,19 @@ async fn list_peers(
 
 fn peer_view(peer: &Peer, health: &Health) -> Value {
     let (state, last_seen_at, latency_ms, last_error) = match health {
+        // 不是“还没探过”，而是**永远探不到**：没有地址就没法探、也没法推。
+        // 必须说成一条可处理的错误 —— 否则它会安静地停在“未探测”，
+        // 和“刚建好、等第一次心跳”长得一模一样（这正是之前藏起来的那个问题）。
+        Health::NoEndpoint => (
+            "no_endpoint",
+            None,
+            None,
+            Some(
+                "没有收数地址：cred 不会探它、也不会给它推送，凭据签发后不会送达。\
+                 补上地址后下一轮心跳才会开始。"
+                    .to_string(),
+            ),
+        ),
         Health::Unknown => ("unknown", None, None, None),
         Health::Up { at, latency_ms } => ("up", Some(*at), Some(*latency_ms), None),
         Health::Down { at, error } => ("down", Some(*at), None, Some(error.clone())),
@@ -298,7 +311,9 @@ async fn create_peer(
             );
             (
                 StatusCode::CREATED,
-                Json(peer_view(&created, &Health::Unknown)),
+                // 建完就按注册表算一次状态：没给地址的新 peer 应立刻显示 no_endpoint，
+                // 而不是先报告一个乐观的 unknown。
+                Json(peer_view(&created, &state.peers.health(&created.name))),
             )
                 .into_response()
         }
@@ -2884,8 +2899,39 @@ mod tests {
         assert_eq!(created["name"], "wist-ingest");
         // 受众就是系统名，不再单独返回一个永远相同的字段。
         assert!(created.get("audience").is_none());
-        assert_eq!(created["health"], "unknown");
+        // 只给了名字、没给收数地址：这不是“还没探过”，而是一个要人处理的状态。
+        // 报成 unknown 会把“永远收不到推送”藏起来。
+        assert_eq!(created["health"], "no_endpoint");
+        assert!(
+            created["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("收数地址"),
+            "no_endpoint must say what is missing: {created}"
+        );
         assert_eq!(created["created_by"], "alice");
+    }
+
+    #[tokio::test]
+    async fn a_peer_created_with_an_endpoint_is_merely_unprobed() {
+        let harness = Harness::new().with_signer();
+        let body = json!({
+            "name": "wist-ingest",
+            "host": "ingest.internal",
+            "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials"
+        });
+        let (status, created) = harness
+            .call(
+                "POST",
+                "/api/v1/peers",
+                Some("alice"),
+                "127.0.0.1",
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {created}");
+        assert_eq!(created["health"], "unknown");
+        assert!(created["last_error"].is_null());
     }
 
     #[tokio::test]
@@ -3153,6 +3199,10 @@ mod tests {
             body["probe_url"].is_null(),
             "manual mode has nothing to probe"
         );
+        // 清掉地址后不能退回“未探测”：那看起来像“等一下就好”，
+        // 而事实是这个系统从此收不到推送。
+        assert_eq!(body["health"], "no_endpoint");
+        assert!(!body["last_error"].is_null());
 
         let (status, body) = harness
             .call(

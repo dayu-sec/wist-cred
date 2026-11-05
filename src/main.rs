@@ -93,6 +93,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     for peer in peers.list() {
+        if peer
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            // 这类 peer 会被心跳直接跳过，永远停在“未探测”。启动时就说出来，
+            // 否则现场只会看到“注册成功了，可是什么都不动”。
+            log::warn!(
+                "auth system {} has no ingest endpoint: it will never be probed and \
+                 will never receive pushed credentials until one is set",
+                peer.name
+            );
+        }
         log::info!(
             "auth system: name={} host={:?} endpoint={:?}",
             peer.name,
@@ -138,12 +153,24 @@ async fn main() -> anyhow::Result<()> {
 /// 周期性探测每个认证系统。状态只留在内存里：重启后先显示"未知"，等第一次探测。
 async fn heartbeat_loop(pusher: Arc<Pusher>, peers: Arc<PeerRegistry>, seconds: u64) {
     let mut ticker = tokio::time::interval(Duration::from_secs(seconds));
+    // 只提醒一次的集合：没地址的 peer 每个周期都会被跳过，逐轮打 warn 只会淹掉日志。
+    // 地址补上之后从集合里移除，将来再被清空还能重新提醒。
+    let mut warned: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         ticker.tick().await;
         for peer in peers.list() {
             let Some(url) = peer.probe_url() else {
-                continue; // 没配地址 = 手工分发模式，不探。
+                // 没配地址 = 手工分发模式，不探。但这**不是正常状态**：
+                // 它意味着永远收不到推送，所以要显式警告一次。
+                if warned.insert(peer.name.clone()) {
+                    log::warn!(
+                        "auth system {} has no ingest endpoint: skipping probes until one is set",
+                        peer.name
+                    );
+                }
+                continue;
             };
+            warned.remove(&peer.name);
             let previous = peers.health(&peer.name);
             // 探一次可能要等到超时；这期间地址可能被人改过。结论只对“探的那个地址”有效，
             // 所以写回前再确认一次，否则会把旧地址的结论盖到新地址头上。

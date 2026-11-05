@@ -26,7 +26,7 @@ Wist **凭据服务**（设计文档里的 **C**）。
 | `GET /api/v1/credentials/{id}` | 单条 |
 | `POST /api/v1/credentials/{id}/revoke` | 撤销（幂等：重放不重复升 revision） |
 | `GET /api/v1/policy` | 签发策略：`max_ttl_seconds` / `break_glass_max_ttl_seconds`（页面用它把超限选项标出来） |
-| `GET /api/v1/peers` | 列出认证系统（含**心跳状态**：`unknown` / `up`+延迟 / `down`+原因） |
+| `GET /api/v1/peers` | 列出认证系统（含**心跳状态**：`no_endpoint` / `unknown` / `up`+延迟 / `down`+原因） |
 | `POST /api/v1/peers` | 新建认证系统（名称 / 主机名 / 收数地址）；落 `state/peers.json`，**不需重启** |
 | `POST /api/v1/peers/{name}/endpoint` | 改收数地址（`null` = 退回手工分发），下一轮心跳即生效 |
 | `POST /api/v1/peers/{name}/setup` | 接入落点：要不要顺手写配置（`config_path`）/ 重启（`restart_cmd`） |
@@ -83,6 +83,7 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
 | `endpoint` 只给 `https://host:port`（没路径） | 落库时**自动补** `/api/v1/internal/credentials`（已有路径则原样保留，尾斜杠去掉） |
 | 认证系统有 `endpoint` 但推送失败 | `500 credential_delivery_pending`，**不给明文** |
 | 接入券重复兑现 / 过期 | `401 enrollment_rejected`（不区分原因） |
+| 接入脚本没给收数地址、也没显式 `--manual` | **拒跑**（在生成材料之前），不消耗券；`--manual` 才允许“只做人工分发”，并明说收不到推送 |
 | 坏 CSR | `400 invalid_csr`，**不消耗券** |
 
 ## 运行
