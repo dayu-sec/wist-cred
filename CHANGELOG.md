@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.3-alpha] - 2026-11-06
+
+### 删除（破坏性）：`POST /api/v1/peers/{name}/setup`
+
+“接入落点”（材料目录 / `config_path` / `restart_cmd`）曾经可以在页面上随时改、下次签发
+就烘进脚本。页面自 `wist-cred-web 0.4.2` 起已经不再提供入口（接入口只剩自注册 + 令牌），
+这条路径就只剩下“旧页面还在调”和“curl 手工调”两种用法 —— 留着它只会让人以为改完就生效。
+
+- 路由、处理器与 `PeerRegistry::set_setup` 一并删除；改它现在返回 `404`，而不是静默成功。
+- 落点仍然**可以给**，只是变成部署时的事：种子的 `identity/…/peer.json`，
+  或栈声明的 `CRED_PEER_DIRS`（只覆盖材料目录）。新建接口本来就不收这三个字段。
+- 三个字段的校验（去两端空白、拒换行 —— 它们会进脚本的单行赋值）随入口搬到新建，
+  用例同步改写；`join.sh` 仍然会把它们写成 `WIST_CRED_INSTALL_DIR` /
+  `WIST_CRED_CONFIG_FILE` / `WIST_CRED_RESTART_CMD` 的默认值。
+- **跟版要求**：页面请用 `wist-cred-web >= 0.4.2-alpha`（更旧的页面会在这条路由上拿到 404，
+  不影响其它功能）；部署栈 `wist-cred-stack 0.6.4-alpha` 已把两边钉在一起。
+
 ## [0.6.2-alpha] - 2026-11-06
 
 ### 新增：公开的 `GET /api/v1/version`（页面右上角的三个版本号）
