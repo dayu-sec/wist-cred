@@ -499,6 +499,9 @@ async fn mint_script(
     Json(json!({
         "peer": target.name,
         "host": target.host,
+        // 一次性券本身：**自注册页（`/__init`）要的就是它**。不再让前端从 `path`
+        // 里抠字符串 —— 那是把展示格式当契约用。按钮权限不变（还是操作者认证后的接口）。
+        "ticket": token,
         "path": format!("/enroll/{token}/join.sh"),
         "expires_in": expires_in,
     }))
@@ -2136,6 +2139,14 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK, "{minted}");
         let path = minted["path"].as_str().expect("path").to_string();
+        // 券要**单独**给出来：自注册页（`/__init`）只收这一串，不需要 join.sh。
+        let ticket = minted["ticket"].as_str().expect("ticket").to_string();
+        assert!(ticket.starts_with("wot_"), "{ticket}");
+        assert_eq!(
+            path,
+            format!("/enroll/{ticket}/join.sh"),
+            "ticket 与 path 必须指向同一张券"
+        );
 
         // 不带任何口令：靠券本身。
         let (status, body) = harness.call_text("GET", &path, None, "127.0.0.1").await;
