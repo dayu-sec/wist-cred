@@ -13,7 +13,7 @@
 //!
 //! 心跳状态**不落盘**：它十分钟就过时了，重启后应该老老实实显示"未知"，等第一次探测。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -147,6 +147,13 @@ struct FileData {
     revision: u64,
     #[serde(default)]
     peers: Vec<Peer>,
+    /// 被删掉的系统名（**墓碑**）。
+    ///
+    /// 为什么要有：部署种子（`onboarding.dir/*/peer.json`）是挂载进来的，删不掉；
+    /// 人删掉一个种子系统后，如果只从表里去掉，下次重启 `import_dir` 又会把它"新导入"回来 ——
+    /// 删除等于没删。墓碑让导入跳过它，直到有人用同名重新建一个。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<String>,
 }
 
 /// 注册表。读多写少；探测每 N 秒刷一次健康状态。
@@ -158,6 +165,8 @@ pub struct PeerRegistry {
 struct State {
     peers: BTreeMap<String, Peer>,
     health: BTreeMap<String, Health>,
+    /// 墓碑：删掉的名字，`import_dir` 跳过它们（见 `FileData::removed`）。
+    removed: BTreeSet<String>,
     revision: u64,
 }
 
@@ -204,6 +213,7 @@ impl PeerRegistry {
             state: Mutex::new(State {
                 peers,
                 health: BTreeMap::new(),
+                removed: data.removed.into_iter().collect(),
                 revision: data.revision,
             }),
         };
@@ -284,6 +294,14 @@ impl PeerRegistry {
         for peer in to_write {
             if state.peers.contains_key(&peer.name) {
                 continue; // 运行期以注册表为准
+            }
+            if state.removed.contains(&peer.name) {
+                // 人删过这个种子：别让重启把它"复活"（墓碑见 `FileData::removed`）。
+                log::info!(
+                    "skip importing {:?}: it was deleted from the registry",
+                    peer.name
+                );
+                continue;
             }
             imported.push(peer.name.clone());
             state.peers.insert(peer.name.clone(), peer);
@@ -423,6 +441,8 @@ impl PeerRegistry {
         }
         let before = state.peers.clone();
         let revision = state.revision;
+        // 同名重建：墓碑作废（人明确想让它回来）。
+        state.removed.remove(&name);
         state.peers.insert(name.clone(), peer.clone());
         state.revision += 1;
         let snapshot = snapshot(&state);
@@ -503,6 +523,36 @@ impl PeerRegistry {
 }
 
 impl PeerRegistry {
+    /// 删除一个认证系统（`DELETE /api/v1/peers/{name}`）。
+    ///
+    /// 语义上就是"从注册表里去掉"：
+    /// - 它的凭据**不吊销**（cred 不持有"吊销整套系统"的概念；要停用请逐条撤销）；
+    /// - 它不再被推送、不再被探活；
+    /// - 名字进**墓碑**：同名种子重启后也不会复活（见 `FileData::removed`），
+    ///   直到有人用同名重新建一个。
+    ///
+    /// 落盘失败要把内存退回（否则页面显示删了、重启又回来）。
+    pub fn remove(&self, name: &str) -> Result<Peer, PeerError> {
+        let mut state = self.lock();
+        let Some(peer) = state.peers.remove(name) else {
+            return Err(PeerError::NotFound(name.to_string()));
+        };
+        let revision = state.revision;
+        let was_removed = state.removed.insert(name.to_string());
+        state.health.remove(name);
+        state.revision += 1;
+        let snapshot = snapshot(&state);
+        if let Err(error) = write(&self.path, &snapshot) {
+            state.peers.insert(peer.name.clone(), peer);
+            if !was_removed {
+                state.removed.remove(name);
+            }
+            state.revision = revision;
+            return Err(PeerError::Store(format!("{error:#}")));
+        }
+        Ok(peer)
+    }
+
     /// 操作者改收数地址（`None` / 空串 = **撤销**：这条系统将不能再接入、也不再被探/推）。
     ///
     /// 与 `report`（只补空）相反：这里**覆盖**，因为是人明确要求的。
@@ -816,6 +866,7 @@ fn snapshot(state: &State) -> FileData {
     FileData {
         revision: state.revision,
         peers: state.peers.values().cloned().collect(),
+        removed: state.removed.iter().cloned().collect(),
     }
 }
 
@@ -953,6 +1004,56 @@ mod tests {
             install_dir: None,
             restart_cmd: None,
         }
+    }
+
+    /// 删除：从表里去掉 + 落墓碑（重启后同名种子不会复活），同名重建时墓碑作废。
+    #[test]
+    fn delete_removes_the_peer_and_keeps_a_tombstone() {
+        let dir = TempDir::new();
+        let reg = registry(&dir);
+        reg.create(new_peer("console"), "alice").expect("create");
+
+        let removed = reg.remove("console").expect("remove");
+        assert_eq!(removed.name, "console");
+        assert!(reg.get("console").is_none(), "内存里也要没了");
+        assert!(matches!(
+            reg.remove("console").unwrap_err(),
+            PeerError::NotFound(_)
+        ));
+
+        // 落盘：重开后依然是"没有"，且墓碑还在。
+        let reopened = registry(&dir);
+        assert!(reopened.get("console").is_none());
+        let state = reopened.lock();
+        assert!(state.removed.contains("console"), "墓碑要持久化");
+        drop(state);
+
+        // 同名重建：墓碑作废，系统回来。
+        reg.create(new_peer("console"), "bob").expect("recreate");
+        let state = reg.lock();
+        assert!(!state.removed.contains("console"), "重建后不该再被墓碑挡住");
+    }
+
+    /// 种子导入跳过已删除的名字（否则每次重启都把它"复活"）。
+    #[test]
+    fn import_skips_a_name_that_was_deleted() {
+        let dir = TempDir::new();
+        let seeds = dir.0.join("onboarding");
+        fs::create_dir_all(seeds.join("ingest")).expect("seed dir");
+        fs::write(
+            seeds.join("ingest").join("peer.json"),
+            r#"{"name":"ingest","host":"ingest.internal","roles":["read"],"endpoint":"https://ingest.internal:19443/api/v1/internal/credentials"}"#,
+        )
+        .expect("seed file");
+
+        let reg = registry(&dir);
+        assert_eq!(reg.import_dir(&seeds).expect("import"), vec!["ingest"]);
+        reg.remove("ingest").expect("remove");
+
+        // 重启后再次导入：不该回来。
+        let reopened = registry(&dir);
+        assert!(reopened.import_dir(&seeds).expect("import").is_empty());
+        assert!(reopened.get("ingest").is_none(), "墓碑拦住了种子");
     }
 
     /// 接入落点（材料目录 / 配置 / 重启）现在只有一个入口：**新建**（种子里给）。

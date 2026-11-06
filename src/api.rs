@@ -12,6 +12,7 @@
 //! | `GET  /api/v1/peers` | 列出认证系统 + **心跳状态** |
 //! | `POST /api/v1/peers` | 新建认证系统（名称 / 主机名 / 收数地址） |
 //! | `POST /api/v1/peers/{name}/enrollment-tickets` | 签一张**一次性**接入券 |
+//! | `DELETE /api/v1/peers/{name}` | 删除一个认证系统（**不吊销**它已签发的凭据；名字进墓碑） |
 //! | `GET  /enroll/{token}/join.sh` | 取出接入脚本（只有公开材料 + 券） |
 //! | `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**） |
 //! | `GET  /healthz` / `GET /version` | 探针 |
@@ -38,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -101,6 +102,8 @@ pub fn router(state: AppState) -> Router {
         // 镜像，灰度期页面可能还在调旧的；下个版本删。
         .route("/api/v1/peers", get(list_peers).post(create_peer))
         .route("/api/v1/peers/{name}/enrollment-tickets", post(mint_script))
+        // 删除认证系统：只从注册表里去掉（不再推、不再探），它已签发的凭据**不**跟着吊销。
+        .route("/api/v1/peers/{name}", delete(delete_peer))
         .route("/api/v1/peers/{name}/endpoint", post(set_peer_endpoint))
         .route(
             "/api/v1/onboarding/peers",
@@ -166,6 +169,7 @@ async fn landing() -> impl IntoResponse {
             "GET  /api/v1/peers",
             "POST /api/v1/peers",
             "POST /api/v1/peers/{name}/endpoint",
+            "DELETE /api/v1/peers/{name}",
             "POST /api/v1/peers/{name}/enrollment-tickets",
             "GET  /enroll/{token}/join.sh",
             "POST /enroll/{token}/certificate",
@@ -390,6 +394,43 @@ async fn set_peer_endpoint(
                 "failed to persist the peer",
             )
         }
+    }
+}
+
+/// 删除一个认证系统（`DELETE /api/v1/peers/{name}`）。
+///
+/// 只从注册表里去掉：它不再被推送、不再被探活；**已签发的凭据不撤销** ——
+/// cred 不持有"吊销整套系统"的概念，要停用请逐条撤销。名字会进墓碑，
+/// 这样同名的部署种子在重启后不会把它"复活"（见 `peers::FileData::removed`）。
+async fn delete_peer(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let operator = match authorize(&state.config, peer, &headers) {
+        Ok(operator) => operator,
+        Err(denied) => return denied.into_response(),
+    };
+    match state.peers.remove(&name) {
+        Ok(removed) => {
+            log::info!("peer deleted: name={} by={operator}", removed.name);
+            Json(json!({ "removed": removed.name })).into_response()
+        }
+        Err(PeerError::NotFound(_)) => err(
+            StatusCode::NOT_FOUND,
+            "unknown_peer",
+            format!("no auth system named {name:?}"),
+        ),
+        Err(PeerError::Store(message)) => {
+            log::error!("peer store failed: {message}");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_unavailable",
+                "failed to remove the auth system",
+            )
+        }
+        Err(other) => err(StatusCode::BAD_REQUEST, "invalid_peer", other.to_string()),
     }
 }
 
@@ -1882,6 +1923,7 @@ mod tests {
             "GET  /api/v1/peers",
             "POST /api/v1/peers",
             "POST /api/v1/peers/{name}/endpoint",
+            "DELETE /api/v1/peers/{name}",
             "POST /api/v1/peers/{name}/enrollment-tickets",
             "GET  /enroll/{token}/join.sh",
             "POST /enroll/{token}/certificate",

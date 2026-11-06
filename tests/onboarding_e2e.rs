@@ -167,6 +167,29 @@ impl Harness {
         into.to_path_buf()
     }
 
+    /// 管理面请求：带页面口令，返回 (状态码, 响应体)。
+    fn admin(&self, method: &str, path: &str) -> (u16, String) {
+        let url = format!("http://{}{}", self.addr, path);
+        let out = Command::new("curl")
+            .args([
+                "-sS",
+                "-o",
+                "-",
+                "-w",
+                "\n%{http_code}",
+                "-X",
+                method,
+                "-H",
+                &format!("authorization: Bearer {PAGE_PASSWORD}"),
+                &url,
+            ])
+            .output()
+            .expect("run curl");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let (body, code) = text.rsplit_once('\n').expect("curl -w output");
+        (code.trim().parse().expect("status code"), body.to_string())
+    }
+
     fn run_script(cwd: &Path, script: &Path, args: &[&str]) -> Output {
         let mut command = Command::new("bash");
         command.arg(script).args(args).current_dir(cwd);
@@ -177,6 +200,30 @@ impl Harness {
         }
         command.output().expect("run join.sh")
     }
+}
+
+/// 删除：路由通、列表里没了、落盘里有墓碑（种子重启不复活）。
+#[test]
+fn delete_peer_removes_it_and_leaves_a_tombstone() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let harness = runtime.block_on(start("delete-peer"));
+
+    let (status, list) = harness.admin("GET", "/api/v1/peers");
+    assert_eq!(status, 200, "列表：{list}");
+    assert!(list.contains("wist-center"), "删除前应该在：{list}");
+
+    let (status, body) = harness.admin("DELETE", "/api/v1/peers/wist-center");
+    assert_eq!(status, 200, "删除：{body}");
+    assert!(body.contains("wist-center"), "响应里要有删掉的名字：{body}");
+
+    let (status, list) = harness.admin("GET", "/api/v1/peers");
+    assert_eq!(status, 200, "列表：{list}");
+    assert!(!list.contains("wist-center"), "删除后不该再出现：{list}");
+
+    // 再删一次：404（幂等不等于成功，页面据此报错）。
+    let (status, body) = harness.admin("DELETE", "/api/v1/peers/wist-center");
+    assert_eq!(status, 404, "重复删除：{body}");
+    assert!(body.contains("unknown_peer"), "错误码：{body}");
 }
 
 /// 本机能用的 UTF-8 locale（优先 en_US，再 C）。
