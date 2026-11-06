@@ -24,7 +24,7 @@ use wist_cred::peers::{NewPeer, PeerRegistry};
 use wist_cred::store::Store;
 use wist_pki::CertificateAuthority;
 
-const OPERATOR_HEADER: &str = "x-wist-operator";
+const PAGE_PASSWORD: &str = "e2e-page-password";
 
 struct Harness {
     addr: SocketAddr,
@@ -66,9 +66,8 @@ async fn start_with(tag: &str, with_endpoint: bool) -> Harness {
     let config = Config {
         server: ServerConfig {
             listen_addr: "127.0.0.1:0".to_string(),
-            mode: AuthMode::Ingress,
-            ingress_header: OPERATOR_HEADER.to_string(),
-            admin_password_hash: String::new(),
+            mode: AuthMode::Token,
+            admin_password_hash: wist_auth::sha256_hex(PAGE_PASSWORD),
             trusted_peers: vec!["127.0.0.1/32".to_string()],
             // 故意不配：走 Host 头推（curl 会带端口），顺便钉住这条路径。
             public_base_url: None,

@@ -27,12 +27,6 @@ trusted_peers = ["10.0.20.10/32", "127.0.0.1/32"]
 # **走反代就配它**：nginx 默认的 `$host` 不带端口，接入脚本里的登记地址会把 `:4444` 弄丢。
 public_base_url = "https://cred.example.com:4444"
 
-# 开发态 / 已经有入口认证的场合：人身份由内网反代注入 `x-wist-operator`。
-# 那是浏览器原生弹窗，**没有登录框/登出**，不要用在发布态。
-# mode = "ingress"
-# ingress_header = "x-wist-operator"
-# trusted_peers = ["10.0.20.10/32"]          # ingress 模式必填
-
 # 阶段二（**现在不做**）：接用户中心 / 钉钉 OIDC。页面与授权逻辑不变，只换“口令从哪来”。
 # 注意：写出来会**直接拒绝启动**，而不是静默退化成不校验。
 # mode = "oidc"

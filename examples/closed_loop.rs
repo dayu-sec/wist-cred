@@ -34,7 +34,7 @@ use wist_cred::onboarding::TicketStore;
 use wist_cred::peers::{NewPeer, PeerRegistry};
 use wist_cred::store::Store;
 
-const OPERATOR_HEADER: &str = "x-wist-operator";
+const PAGE_PASSWORD: &str = "closed-loop-page-password";
 
 #[derive(Deserialize)]
 struct CredFile {
@@ -52,9 +52,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config {
         server: ServerConfig {
             listen_addr: "127.0.0.1:18443".to_string(),
-            mode: AuthMode::Ingress,
-            ingress_header: OPERATOR_HEADER.to_string(),
-            admin_password_hash: String::new(),
+            mode: AuthMode::Token,
+            admin_password_hash: wist_auth::sha256_hex(PAGE_PASSWORD),
             trusted_peers: vec!["127.0.0.1/32".to_string()],
             public_base_url: None,
         },
@@ -212,7 +211,7 @@ async fn call(
     let builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header(OPERATOR_HEADER, "alice");
+        .header("authorization", format!("Bearer {PAGE_PASSWORD}"));
     let request = match body {
         Some(body) => builder
             .header("content-type", "application/json")

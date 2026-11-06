@@ -57,9 +57,11 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
 ```
 
 - **人机面怎么验**（`server.mode`）：
-  - `token`（发布态）：上面的 `Authorization: Bearer <页面口令>` —— 页面里输的那把，
+  - `token`（唯一的发布态模式）：上面的 `Authorization: Bearer <页面口令>` —— 页面里输的那把，
     配置里只写 `admin_password = "${SEC_CRED_WEB_PASSWORD}"`，加载时算成 sha256、明文丢弃；
-  - `ingress`（开发态）：人身份由内网反代注入 `x-wist-operator`，客户端不自己填。
+  - `oidc`：留给用户中心 / 钉钉，本期未实现（写出来会拒启）。
+  - 曾经还有 `ingress`（身份由内网反代注入 `x-wist-operator`），**0.7.0 已删除**：
+    那等于信任一个客户端可伪造的头；需要按人区分身份时走 OIDC，不是信任头。
 - **口令两端不能有空白**：两端都会被裁掉（`bearer_token` 与页面输入都 trim），
   配置里带空白的口令直接拒启 —— 否则会出现“看着对、永远对不上”的怪事。
 - **`trusted_peers` 空 = 不限**：两种模式、人机面与接入面（取脚本 / 登记）用同一个口径；
@@ -72,10 +74,10 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
 
 | 约束 | 行为 |
 |---|---|
-| `mode = "ingress"` 不得绑 `0.0.0.0` / `[::]`（S1） | 加载期拒绝启动 |
-| `mode = "ingress"` 时 `trusted_peers` 为空（S3 的前提） | 加载期拒绝启动 |
-| 对端不在 `trusted_peers` | `401 untrusted_ingress_peer` + 告警 |
-| 缺操作者头 | `401 missing_operator` |
+| `listen_addr` 绑 `0.0.0.0` / `[::]`（S1） | 加载期拒绝启动 |
+| `mode = "token"` 时 `admin_password` 缺失 / 解出空串 | 加载期拒绝启动 |
+| 对端不在 `trusted_peers` | `401 untrusted_peer` + 告警 |
+| 缺口令（`Authorization: Bearer`） | `401 missing_admin_bearer_token` |
 | `mode = "oidc"` | 加载期拒绝启动（本期不做） |
 | `ttl_seconds` 超上限 | 静默压到上限（脚本 30d / break-glass 90d） |
 | 配了 `[[issue.targets]]` 但 `audience` 不在其中 | `400 audience_not_configured` |

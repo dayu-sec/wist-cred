@@ -16,10 +16,10 @@
 //! | `POST /enroll/{token}/certificate` | X 交 CSR 换自己的服务器证书（**兑现券**） |
 //! | `GET  /healthz` / `GET /version` | 探针 |
 //!
-//! 人身份由**本服务自己验**（`server.mode`）：
+//! 人身份由**本服务自己验**（`server.mode`），**永不从请求头取身份**：
 //!
 //!   - `token`（发布态）：页面输口令 → `Authorization: Bearer <口令>`，配置里只存口令的 sha256；
-//!   - `ingress`（开发态 / 已经有入口认证的场合）：由内网反代注入 `x-wist-operator`。
+//!   - `oidc`：留给用户中心 / 钉钉（本期未实现，写出来会拒启）。
 //!
 //! 两种模式下都可以再用 `trusted_peers` 收窄对端（空 = 不限）。
 //! **两条不走人机认证**：取脚本、交 CSR。取它们的是 X（机器），它没有操作者；
@@ -171,7 +171,7 @@ async fn landing() -> impl IntoResponse {
             "POST /enroll/{token}/certificate",
         ],
         "auth": "requests under /api/v1 need `Authorization: Bearer <password>` in token mode \
-                 (the page asks for it), or the operator header injected by the ingress in ingress mode \
+                 (the page asks for it) \
                  — except GET /api/v1/version (probe: no credentials) and the /enroll/{token}/… family, \
                  which is authorised by the one-time ticket itself \
                  (join.sh: re-fetchable, certificate: single use)",
@@ -457,7 +457,7 @@ async fn fetch_script(
         log::warn!("untrusted peer tried to fetch an onboarding script: {peer}");
         return err(
             StatusCode::UNAUTHORIZED,
-            "untrusted_ingress_peer",
+            "untrusted_peer",
             "peer is not in server.trusted_peers",
         );
     }
@@ -547,7 +547,7 @@ async fn enroll_bundle(
         log::warn!("untrusted peer tried to fetch the enrollment bundle: {peer}");
         return err(
             StatusCode::UNAUTHORIZED,
-            "untrusted_ingress_peer",
+            "untrusted_peer",
             "peer is not in server.trusted_peers",
         );
     }
@@ -658,7 +658,7 @@ async fn enroll_peer(
         log::warn!("untrusted peer tried to enroll: {peer}");
         return err(
             StatusCode::UNAUTHORIZED,
-            "untrusted_ingress_peer",
+            "untrusted_peer",
             "peer is not in server.trusted_peers",
         );
     }
@@ -1395,21 +1395,20 @@ impl Denied {
 /// 人机面的授权。两条路（见 `mode`）：
 ///
 /// - `token`：验 `Authorization: Bearer <口令>`（sha256 常量时间），返回 `admin:<指纹>`；
-/// - `ingress`：要求 `x-wist-operator` 头（由内网反代注入），返回操作者名。
+/// - `oidc`：未实现（写出来就拒启，走到这里也只会 401）。
 ///
 /// `trusted_peers` 非空时先过这一道（S3）。
 fn authorize(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> Result<String, Denied> {
     if peer_denied(config, peer.ip()) {
-        log::warn!("untrusted ingress peer rejected: {peer}");
+        log::warn!("untrusted peer rejected: {peer}");
         return Err(Denied::new(
             StatusCode::UNAUTHORIZED,
-            "untrusted_ingress_peer",
+            "untrusted_peer",
             "peer is not in server.trusted_peers",
         ));
     }
     match config.server.mode {
         AuthMode::Token => authorize_password(config, peer, headers),
-        AuthMode::Ingress => authorize_ingress(config, headers),
         AuthMode::Oidc => Err(Denied::new(
             StatusCode::UNAUTHORIZED,
             "unsupported_auth_mode",
@@ -1451,26 +1450,6 @@ fn authorize_password(
     Ok(admin_actor(&config.server.admin_password_hash))
 }
 
-/// `mode = ingress`：操作者头由内网反代注入。
-fn authorize_ingress(config: &Config, headers: &HeaderMap) -> Result<String, Denied> {
-    let operator = headers
-        .get(config.server.ingress_header.as_str())
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    match operator {
-        Some(operator) => Ok(operator.to_string()),
-        None => Err(Denied::new(
-            StatusCode::UNAUTHORIZED,
-            "missing_operator",
-            format!(
-                "missing {} header (injected by the internal ingress)",
-                config.server.ingress_header
-            ),
-        )),
-    }
-}
-
 /// 令牌模式下，审计里的“发起人”。
 ///
 /// 为什么不写口令、也不写 `admin` 一个词：
@@ -1491,10 +1470,8 @@ fn admin_actor(password_hash: &str) -> String {
 
 /// `trusted_peers`：CIDR / 单个 IP。`unix:` 条目对 TCP 对端不适用，跳过。
 ///
-/// **空列表 = 不做来源限制**（只写一处，两种模式、人机面与接入面共用同一个口径）：
-/// 以前这里是“空 = 谁都不行”，而 `ingress` 模式又强制非空，所以看不出差别；
-/// `token` 模式下 `trusted_peers` 是可选的，若接入面仍按“空 = 全拒”处理，
-/// 就会变成“人机面能用、取接入脚本全 401”的隐形故障。
+/// **空列表 = 不做来源限制**（只写一处，人机面与接入面共用同一个口径）：
+/// 以前接入面按“空 = 全拒”处理，会变成“人机面能用、取接入脚本全 401”的隐形故障。
 fn peer_denied(config: &Config, ip: IpAddr) -> bool {
     !config.server.trusted_peers.is_empty() && !peer_allowed(config, ip)
 }
@@ -1604,7 +1581,6 @@ fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
 fn mode_name(mode: AuthMode) -> &'static str {
     match mode {
         AuthMode::Token => "token",
-        AuthMode::Ingress => "ingress",
         AuthMode::Oidc => "oidc",
     }
 }
@@ -1642,7 +1618,16 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    const OPERATOR_HEADER: &str = "x-wist-operator";
+    /// 默认 harness 用的口令（以及它在审计里的身份）。
+    ///
+    /// 以前默认是 `ingress`（操作者头即身份）。它被删掉后，测试统一走 token ——
+    /// “谁在操作”不再是一个可以被请求方写出来的头。
+    const PAGE_PASSWORD: &str = "page-password";
+
+    /// token 模式的审计身份：`admin:<sha256 前 12 位>`。
+    fn page_actor() -> String {
+        admin_actor(&wist_auth::sha256_hex(PAGE_PASSWORD))
+    }
     const CLIENT_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
 
     struct Harness {
@@ -1654,9 +1639,8 @@ mod tests {
         fn new() -> Self {
             Self::with_server(ServerConfig {
                 listen_addr: "127.0.0.1:8443".to_string(),
-                mode: AuthMode::Ingress,
-                ingress_header: OPERATOR_HEADER.to_string(),
-                admin_password_hash: String::new(),
+                mode: AuthMode::Token,
+                admin_password_hash: wist_auth::sha256_hex(PAGE_PASSWORD),
                 trusted_peers: vec!["127.0.0.1/32".to_string()],
                 public_base_url: None,
             })
@@ -1667,7 +1651,6 @@ mod tests {
             Self::with_server(ServerConfig {
                 listen_addr: "127.0.0.1:8443".to_string(),
                 mode: AuthMode::Token,
-                ingress_header: OPERATOR_HEADER.to_string(),
                 admin_password_hash: wist_auth::sha256_hex(password),
                 trusted_peers: Vec::new(),
                 public_base_url: None,
@@ -1678,9 +1661,8 @@ mod tests {
         fn with_public_base(base: &str) -> Self {
             Self::with_server(ServerConfig {
                 listen_addr: "127.0.0.1:8443".to_string(),
-                mode: AuthMode::Ingress,
-                ingress_header: OPERATOR_HEADER.to_string(),
-                admin_password_hash: String::new(),
+                mode: AuthMode::Token,
+                admin_password_hash: wist_auth::sha256_hex(PAGE_PASSWORD),
                 trusted_peers: vec!["127.0.0.1/32".to_string()],
                 public_base_url: Some(base.to_string()),
             })
@@ -1807,20 +1789,15 @@ mod tests {
             &self,
             method: &str,
             uri: &str,
-            operator: Option<&str>,
+            credential: Option<&str>,
             peer: &str,
             body: Option<Value>,
         ) -> (StatusCode, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
-            // 测试的调用点早就把“人”作为第 3 个参数传进来了：ingress 模式当操作者头，
-            // token 模式当页面口令 —— 两边都是“谁在动这个页面”。
-            if let Some(credential) = operator {
-                builder = match self.state.config.server.mode {
-                    AuthMode::Token => {
-                        builder.header("authorization", format!("Bearer {credential}"))
-                    }
-                    _ => builder.header(OPERATOR_HEADER, credential),
-                };
+            // 第 3 个参数是“页面口令” —— 全仓只有 `Authorization: Bearer` 一条路，
+            // 不再有“反代注入的操作者头”那种可以被请求方伪造的身份来源。
+            if let Some(credential) = credential {
+                builder = builder.header("authorization", format!("Bearer {credential}"));
             }
             let request = match body {
                 Some(body) => builder
@@ -1853,17 +1830,12 @@ mod tests {
             &self,
             method: &str,
             uri: &str,
-            operator: Option<&str>,
+            credential: Option<&str>,
             peer: &str,
         ) -> (StatusCode, String) {
             let mut builder = Request::builder().method(method).uri(uri);
-            if let Some(credential) = operator {
-                builder = match self.state.config.server.mode {
-                    AuthMode::Token => {
-                        builder.header("authorization", format!("Bearer {credential}"))
-                    }
-                    _ => builder.header(OPERATOR_HEADER, credential),
-                };
+            if let Some(credential) = credential {
+                builder = builder.header("authorization", format!("Bearer {credential}"));
             }
             let mut request = builder.body(Body::empty()).unwrap();
             let peer: SocketAddr = format!("{peer}:40000").parse().unwrap();
@@ -1952,7 +1924,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(create_body()),
             )
@@ -1961,7 +1933,7 @@ mod tests {
 
         let token = body["token"].as_str().expect("token").to_string();
         assert!(token.starts_with(TOKEN_PREFIX));
-        assert_eq!(body["owner"], "alice");
+        assert_eq!(body["owner"], page_actor());
         assert_eq!(body["revision"], 1);
 
         let stored = harness.store_text();
@@ -1979,7 +1951,7 @@ mod tests {
             .call(
                 "GET",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -1988,22 +1960,6 @@ mod tests {
         let text = listed.to_string();
         assert!(!text.contains(&token));
         assert!(!text.contains(&sha256_hex(&token)));
-    }
-
-    #[tokio::test]
-    async fn missing_operator_is_rejected() {
-        let harness = Harness::new();
-        let (status, body) = harness
-            .call(
-                "POST",
-                "/api/v1/credentials",
-                None,
-                "127.0.0.1",
-                Some(create_body()),
-            )
-            .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"]["code"], "missing_operator");
     }
 
     #[tokio::test]
@@ -2057,7 +2013,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_mode_keeps_the_peer_allowlist() {
-        // `trusted_peers` 在 token 模式也是真的一道锁（不是只给 ingress 用的）。
+        // `trusted_peers` 是真的一道锁（不是“只有某种模式才生效”的装饰）。
         let mut harness = Harness::new_token("0123456789abcdef01234567");
         let mut config = (*harness.state.config).clone();
         config.server.trusted_peers = vec!["127.0.0.1/32".to_string()];
@@ -2073,7 +2029,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"]["code"], "untrusted_ingress_peer");
+        assert_eq!(body["error"]["code"], "untrusted_peer");
     }
 
     #[tokio::test]
@@ -2125,13 +2081,13 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "10.9.9.9",
                 Some(create_body()),
             )
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"]["code"], "untrusted_ingress_peer");
+        assert_eq!(body["error"]["code"], "untrusted_peer");
     }
 
     #[tokio::test]
@@ -2143,7 +2099,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -2165,7 +2121,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -2185,7 +2141,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -2203,7 +2159,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -2220,7 +2176,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(create_body()),
             )
@@ -2237,7 +2193,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (status, body) = harness
-            .call("GET", "/api/v1/policy", Some("alice"), "127.0.0.1", None)
+            .call(
+                "GET",
+                "/api/v1/policy",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["max_ttl_seconds"], 2_592_000);
@@ -2276,7 +2238,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({
                     "purpose": "页面不发程序名",
@@ -2301,7 +2263,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -2328,7 +2290,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -2361,7 +2323,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -2377,7 +2339,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(bad),
             )
@@ -2402,7 +2364,7 @@ mod tests {
                 .call(
                     "POST",
                     "/api/v1/credentials",
-                    Some("alice"),
+                    Some(PAGE_PASSWORD),
                     "127.0.0.1",
                     Some(body),
                 )
@@ -2420,7 +2382,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(create_body()),
             )
@@ -2432,7 +2394,7 @@ mod tests {
             .call(
                 "GET",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2452,7 +2414,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials/cred_nope/redeliver",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2469,7 +2431,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(create_body()),
             )
@@ -2479,7 +2441,7 @@ mod tests {
             .call(
                 "POST",
                 &format!("/api/v1/credentials/{id}/revoke"),
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2489,7 +2451,7 @@ mod tests {
             .call(
                 "POST",
                 &format!("/api/v1/credentials/{id}/redeliver"),
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2506,7 +2468,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-center", "host": "center.internal", "roles": ["investigation:run"] })),
             )
@@ -2515,7 +2477,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(create_body()),
             )
@@ -2527,7 +2489,7 @@ mod tests {
             .call(
                 "POST",
                 &format!("/api/v1/credentials/{id}/redeliver"),
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2548,7 +2510,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(create_body()),
             )
@@ -2558,7 +2520,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-center/endpoint",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "https://center.internal:19443/api/v1/internal/credentials" })),
             )
@@ -2568,7 +2530,7 @@ mod tests {
             .call(
                 "POST",
                 &format!("/api/v1/credentials/{id}/redeliver"),
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2584,7 +2546,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/credentials",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(create_body()),
             )
@@ -2593,14 +2555,14 @@ mod tests {
         let uri = format!("/api/v1/credentials/{id}/revoke");
 
         let (status, first) = harness
-            .call("POST", &uri, Some("alice"), "127.0.0.1", None)
+            .call("POST", &uri, Some(PAGE_PASSWORD), "127.0.0.1", None)
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(first["revision"], 2);
         assert!(!first["revoked_at"].is_null());
 
         let (status, second) = harness
-            .call("POST", &uri, Some("bob"), "127.0.0.1", None)
+            .call("POST", &uri, Some(PAGE_PASSWORD), "127.0.0.1", None)
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(second["revision"], 2, "second revoke must not bump again");
@@ -2614,7 +2576,7 @@ mod tests {
             .call(
                 "GET",
                 "/api/v1/credentials/cred_nope",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2634,7 +2596,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-center/enrollment-tickets",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2659,9 +2621,8 @@ mod tests {
     fn server_with_base(base: Option<&str>) -> ServerConfig {
         ServerConfig {
             listen_addr: "127.0.0.1:8443".to_string(),
-            mode: AuthMode::Ingress,
-            ingress_header: OPERATOR_HEADER.to_string(),
-            admin_password_hash: String::new(),
+            mode: AuthMode::Token,
+            admin_password_hash: wist_auth::sha256_hex(PAGE_PASSWORD),
             trusted_peers: Vec::new(),
             public_base_url: base.map(str::to_string),
         }
@@ -2767,7 +2728,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/enrollment-tickets",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2802,7 +2763,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/setup",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({"config_path": "/etc/x/ctrl.toml"})),
             )
@@ -2811,7 +2772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onboarding_peers_need_an_operator() {
+    async fn onboarding_peers_need_the_page_password() {
         let harness = Harness::new()
             .with_peer("wist-ingest", "ingest.internal")
             .with_signer();
@@ -2820,10 +2781,16 @@ mod tests {
             .call("GET", "/api/v1/peers", None, "127.0.0.1", None)
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(body["error"]["code"], "missing_operator");
+        assert_eq!(body["error"]["code"], "missing_admin_bearer_token");
 
         let (status, body) = harness
-            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .call(
+                "GET",
+                "/api/v1/peers",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["peers"][0]["name"], "wist-ingest");
@@ -2843,7 +2810,7 @@ mod tests {
             .call(
                 "GET",
                 "/api/v1/onboarding/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2855,7 +2822,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/onboarding/peers/wist-ingest/script",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2896,7 +2863,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/enrollment-tickets",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2931,7 +2898,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/enrollment-tickets",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2949,7 +2916,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/enrollment-tickets",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2965,7 +2932,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/nope/enrollment-tickets",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )
@@ -2997,7 +2964,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -3007,7 +2974,7 @@ mod tests {
         // 受众就是系统名，不再单独返回一个永远相同的字段。
         assert!(created.get("audience").is_none());
         assert_eq!(created["health"], "unknown");
-        assert_eq!(created["created_by"], "alice");
+        assert_eq!(created["created_by"], page_actor());
     }
 
     #[tokio::test]
@@ -3018,7 +2985,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-ingest", "host": "ingest.internal" })),
             )
@@ -3040,7 +3007,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -3062,7 +3029,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body.clone()),
             )
@@ -3072,7 +3039,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("bob"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(body),
             )
@@ -3088,7 +3055,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "name": "x", "host": "x.internal", "endpoint": "https://x.internal:19443/x" })),
             )
@@ -3104,7 +3071,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({
                     "name": "wist-ingest",
@@ -3181,7 +3148,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({
                     "name": "wist-ingest",
@@ -3225,7 +3192,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({
                     "name": "wist-ingest",
@@ -3243,7 +3210,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({
                     "name": "wist-ingest",
@@ -3257,7 +3224,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/endpoint",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "https://$(id)/api" })),
             )
@@ -3306,7 +3273,13 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK, "{issued}");
         let (_, listed) = harness
-            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .call(
+                "GET",
+                "/api/v1/peers",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(
             listed["peers"][0]["endpoint"],
@@ -3340,7 +3313,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-ingest/endpoint",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "https://ingest.internal:19443/api/v1/internal/credentials" })),
             )
@@ -3366,7 +3339,7 @@ mod tests {
             .call(
                 "POST",
                 uri,
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "https://other:19443/api/v1/internal/credentials" })),
             )
@@ -3381,7 +3354,7 @@ mod tests {
             .call(
                 "POST",
                 uri,
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": null })),
             )
@@ -3401,7 +3374,7 @@ mod tests {
             .call(
                 "POST",
                 uri,
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "http://plain/x" })),
             )
@@ -3419,7 +3392,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/wist-center/endpoint",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": "https://center.internal:3103" })),
             )
@@ -3439,7 +3412,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers/nope/endpoint",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "endpoint": null })),
             )
@@ -3455,7 +3428,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({
                     "name": "wist-ingest",
@@ -3485,7 +3458,13 @@ mod tests {
         assert!(info.subject.contains("ingest.internal"), "{}", info.subject);
 
         let (_, listed) = harness
-            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .call(
+                "GET",
+                "/api/v1/peers",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(listed["peers"][0]["host"], "ingest.internal");
         assert_eq!(
@@ -3522,7 +3501,13 @@ mod tests {
     async fn listing_peers_reports_health_and_probe_url() {
         let harness = Harness::new().with_peer("wist-ingest", "ingest.internal");
         let (status, body) = harness
-            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .call(
+                "GET",
+                "/api/v1/peers",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["peers"][0]["health"], "unknown");
@@ -3609,7 +3594,7 @@ mod tests {
             .call(
                 "POST",
                 "/api/v1/peers",
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 Some(json!({ "name": "wist-ingest" })),
             )
@@ -3633,7 +3618,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{issued}");
 
         let (_, listed) = harness
-            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .call(
+                "GET",
+                "/api/v1/peers",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(listed["peers"][0]["host"], "ingest.internal");
         assert_eq!(
@@ -3667,7 +3658,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{issued}");
 
         let (_, listed) = harness
-            .call("GET", "/api/v1/peers", Some("alice"), "127.0.0.1", None)
+            .call(
+                "GET",
+                "/api/v1/peers",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
             .await;
         assert_eq!(
             listed["peers"][0]["endpoint"],
@@ -3680,7 +3677,7 @@ mod tests {
             .call(
                 "POST",
                 &format!("/api/v1/peers/{peer}/enrollment-tickets"),
-                Some("alice"),
+                Some(PAGE_PASSWORD),
                 "127.0.0.1",
                 None,
             )

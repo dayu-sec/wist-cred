@@ -1,16 +1,19 @@
 //! 分层配置：主配置 + `${VAR}` 展开（与 center / console 同口径，fail-closed）。
 //!
-//! 人机面（页面）的认证有两种模式，**由服务自己验**，不靠反代注入：
+//! 人机面（页面）的认证只有两种模式，**由服务自己验，永不信任请求头里的身份**：
 //!
-//! - `mode = "token"`（发布态默认）：页面输口令，请求带 `Authorization: Bearer <口令>`；
+//! - `mode = "token"`（发布态）：页面输口令，请求带 `Authorization: Bearer <口令>`；
 //!   配置里只放口令的 **sha256**（`server.admin_password = "${SEC_CRED_WEB_PASSWORD}"`，
 //!   加载时算完就把明文丢掉），与 gateway / center 的管理面同一个形状。
-//! - `mode = "ingress"`（开发态 / 已经有入口认证的场合）：人身份由内网反代注入 `x-wist-operator`。
+//! - `mode = "oidc"`：留给用户中心 / 钉钉，**本期不实现** —— 显式写出来会直接拒绝启动。
+//!
+//! 历史上还有一个 `mode = "ingress"`（身份由内网反代注入 `x-wist-operator`），0.7.0 已删除：
+//! 它把“谁在操作”变成一个**客户端可伪造的头**，安全性完全押在拓扑与反代剥头上；
+//! 而要按人区分身份，正路是 OIDC，不是信任一个头。
 //!
 //! 几条**加载期就拒绝启动**的约束（设计文档 §3.4 的 S1）：
 //!
 //! - listener 不得绑 `0.0.0.0` / `[::]`——同一份代码绑到公网就是后门；
-//! - `mode = "ingress"` 时 `trusted_peers` 不能为空，否则等于谁都能注入操作者头；
 //! - `mode = "token"` 时 `admin_password` 不能为空，否则等于谁都能进页面签发凭据；
 //! - `mode = "oidc"` 是留给用户中心 / 钉钉的位置，**本期不实现**：显式写出来会直接拒绝启动；
 //! - 签发 CA 与推送信任锚必须是同一把 CA，否则会签出自己认不了的证书。
@@ -44,11 +47,10 @@ pub struct Config {
 pub struct ServerConfig {
     pub listen_addr: String,
     pub mode: AuthMode,
-    pub ingress_header: String,
     /// `mode = token` 时页面口令的 **sha256**（十六进制）。明文只在密钥文件里，加载后就丢。
+    /// `mode = oidc` 时为空（身份改由 IdP 断言给出）。
     pub admin_password_hash: String,
-    /// 允许到达人机面的对端（unix socket 路径 / CIDR / 回环）。
-    /// `ingress` 必填；`token` 可选（可用的第二道锁）。
+    /// 允许到达人机面的对端（unix socket 路径 / CIDR / 回环）。可选（可用的第二道锁）。
     pub trusted_peers: Vec<String>,
     /// 对外基址（如 `https://cred.example.com:4444`，不带末尾 `/`）。
     ///
@@ -59,12 +61,12 @@ pub struct ServerConfig {
 }
 
 /// `token`：页面输口令，服务自己验（发布态）；
-/// `ingress`：人身份由内网入口（反代 / 跳板）注入（开发态）；
-/// `oidc`：将来接用户中心 / 钉钉。
+/// `oidc`：将来接用户中心 / 钉钉（本期不实现）。
+///
+/// 曾经还有一个 `ingress`（身份由反代注入头），0.7.0 删除：那等于信任一个客户端可伪造的头。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     Token,
-    Ingress,
     Oidc,
 }
 
@@ -336,8 +338,6 @@ struct RawServer {
     listen_addr: String,
     #[serde(default = "default_mode")]
     mode: String,
-    #[serde(default = "default_ingress_header")]
-    ingress_header: String,
     /// `mode = token` 时的人人面口令。写 `${SEC_CRED_WEB_PASSWORD}`，真值只在密钥文件里。
     #[serde(default)]
     admin_password: Option<String>,
@@ -353,7 +353,6 @@ impl Default for RawServer {
         Self {
             listen_addr: default_listen(),
             mode: default_mode(),
-            ingress_header: default_ingress_header(),
             admin_password: None,
             trusted_peers: Vec::new(),
             public_base_url: None,
@@ -490,11 +489,9 @@ fn default_listen() -> String {
 }
 
 fn default_mode() -> String {
-    "ingress".to_string()
-}
-
-fn default_ingress_header() -> String {
-    "x-wist-operator".to_string()
+    // 默认 token：它需要 `admin_password`，缺了就拒启。默认成“不需要任何身份”的模式
+    // 是 fail-open，宁可起不来。
+    "token".to_string()
 }
 
 fn default_storage_path() -> PathBuf {
@@ -541,10 +538,14 @@ impl RawConfig {
     fn resolve(self, env: &EnvDict) -> anyhow::Result<Config> {
         let mode = match self.server.mode.trim() {
             "token" => AuthMode::Token,
-            "ingress" => AuthMode::Ingress,
             // 位置留在这里，但本期不做：写出来就拒绝启动，避免静默退化成"不校验"。
             "oidc" => bail!("server.mode = \"oidc\" is not implemented yet"),
-            other => bail!("server.mode must be token|ingress|oidc, got {other:?}"),
+            // 0.7.0 删除了这个模式。给出明确出路，而不是一句“取值不对”。
+            "ingress" => bail!(
+                "server.mode = \"ingress\" was removed in 0.7.0: cred no longer trusts an identity \
+                 header; use mode = \"token\" (or wait for mode = \"oidc\")"
+            ),
+            other => bail!("server.mode must be token|oidc, got {other:?}"),
         };
 
         let listen_addr = expand(env, &self.server.listen_addr)?;
@@ -552,17 +553,12 @@ impl RawConfig {
             bail!("server.listen_addr must not be empty");
         }
 
-        // S1 对两种模式都成立：绑 unspecified 地址的 listener 就是一个“谁都能来”的后门。
+        // S1：绑 unspecified 地址的 listener 就是一个“谁都能来”的后门。
         if is_unspecified_host(listener_host(&listen_addr)) {
             bail!(
                 "S1: server.listen_addr must not bind an unspecified address ({listen_addr}); \
-                 bind the private address of the ingress/proxy instead"
+                 bind the private address of the proxy instead"
             );
-        }
-
-        let ingress_header = expand(env, &self.server.ingress_header)?;
-        if mode == AuthMode::Ingress && ingress_header.trim().is_empty() {
-            bail!("server.ingress_header must not be empty when mode = ingress");
         }
 
         // 页面口令：配置里只有 sha256（跟 gateway / center 的管理面同一个形状）。
@@ -596,9 +592,6 @@ impl RawConfig {
             String::new()
         };
 
-        if mode == AuthMode::Ingress && self.server.trusted_peers.is_empty() {
-            bail!("server.trusted_peers must list at least one peer when mode = ingress");
-        }
         // 两条路都要把写错的规则打回去：否则错一个 CIDR 就是“所有人 401”，
         // 而且每个请求都会刷一条 warn。（token 模式下 trusted_peers 可为空 = 不做第二道锁。）
         if !self.server.trusted_peers.is_empty() {
@@ -716,7 +709,6 @@ impl RawConfig {
             server: ServerConfig {
                 listen_addr,
                 mode,
-                ingress_header,
                 admin_password_hash,
                 trusted_peers: self.server.trusted_peers,
                 public_base_url,
@@ -769,15 +761,15 @@ mod tests {
     const MINIMAL: &str = r#"
         [server]
         listen_addr = "10.0.20.11:8443"
-        mode = "ingress"
+        mode = "token"
+        admin_password = "0123456789abcdef01234567"
         trusted_peers = ["10.0.20.10/32"]
     "#;
 
     #[test]
     fn accepts_private_listener() {
         let config = parse(MINIMAL).expect("valid config");
-        assert_eq!(config.server.mode, AuthMode::Ingress);
-        assert_eq!(config.server.ingress_header, "x-wist-operator");
+        assert_eq!(config.server.mode, AuthMode::Token);
         assert_eq!(config.issue.digest, "sha256");
         assert_eq!(config.issue.max_ttl_seconds, 30 * 24 * 60 * 60);
         assert!(config.push.is_none());
@@ -787,7 +779,7 @@ mod tests {
 
     #[test]
     fn accepts_a_loopback_listener_because_it_is_not_unspecified() {
-        let text = "[server]\nlisten_addr = \"[::1]:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"127.0.0.1/32\"]\n";
+        let text = "[server]\nlisten_addr = \"[::1]:8443\"\nmode = \"token\"\nadmin_password = \"x\"\ntrusted_peers = [\"127.0.0.1/32\"]\n";
         assert!(parse(text).is_ok(), "loopback must be allowed");
     }
 
@@ -796,7 +788,7 @@ mod tests {
         // 写错一个 CIDR 的结果是“所有人 401”，且每个请求刷一条 warn —— 加载期就拦。
         for rule in ["10.0.0.0/33", "not-an-ip", "", "10.0.0.0/"] {
             let text = format!(
-                "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"{rule}\"]\n"
+                "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\ntrusted_peers = [\"{rule}\"]\n"
             );
             let err = parse(&text).expect_err("must reject {rule:?}");
             assert!(
@@ -877,17 +869,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_password_is_rejected_outside_token_mode() {
-        // 写了但不生效，比写错键更危险：现场会以为它已经生效。
-        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"10.0.20.10/32\"]\nadmin_password = \"x\"\n";
-        let err = parse(text).expect_err("admin_password only applies to token mode");
-        assert!(
-            err.to_string().contains("only applies to mode = token"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn token_mode_still_validates_trusted_peers() {
         let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\ntrusted_peers = [\"not-an-ip\"]\n";
         let err = parse(text).expect_err("bogus CIDR must be rejected in token mode too");
@@ -899,13 +880,13 @@ mod tests {
 
     #[test]
     fn allows_unix_entries_beside_ip_entries() {
-        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"10.0.20.10/32\", \"unix:/run/wist/cred.sock\"]\n";
+        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\ntrusted_peers = [\"10.0.20.10/32\", \"unix:/run/wist/cred.sock\"]\n";
         let config = parse(text).expect("unix entries are allowed in the list");
         assert_eq!(config.server.trusted_peers.len(), 2);
     }
 
     #[test]
-    fn rejects_unspecified_listener_in_ingress_mode() {
+    fn rejects_unspecified_listener() {
         for addr in [
             "0.0.0.0:8443",
             "[::]:8443",
@@ -915,7 +896,7 @@ mod tests {
             "[::0]:8443",
         ] {
             let text = format!(
-                "[server]\nlisten_addr = \"{addr}\"\nmode = \"ingress\"\ntrusted_peers = [\"10.0.0.1/32\"]\n"
+                "[server]\nlisten_addr = \"{addr}\"\nmode = \"token\"\nadmin_password = \"x\"\ntrusted_peers = [\"10.0.0.1/32\"]\n"
             );
             let err = parse(&text).expect_err("S1 must reject");
             assert!(err.to_string().contains("S1"), "unexpected error: {err}");
@@ -923,11 +904,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_trusted_peers_in_ingress_mode() {
-        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\n";
-        let err = parse(text).expect_err("empty peers must be rejected");
+    fn removed_ingress_mode_fails_closed_with_an_explanation() {
+        // 老配置/老文档里会出现它：报“取值不对”等于让人去猜，直接说出它被删了以及该怎么办。
+        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"ingress\"\ntrusted_peers = [\"10.0.0.1/32\"]\n";
+        let err = parse(text).expect_err("ingress must not start");
         assert!(
-            err.to_string().contains("trusted_peers"),
+            err.to_string().contains("was removed in 0.7.0"),
             "unexpected error: {err}"
         );
     }
