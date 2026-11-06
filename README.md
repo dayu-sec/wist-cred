@@ -64,7 +64,7 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
     那等于信任一个客户端可伪造的头；需要按人区分身份时走 OIDC，不是信任头。
 - **口令两端不能有空白**：两端都会被裁掉（`bearer_token` 与页面输入都 trim），
   配置里带空白的口令直接拒启 —— 否则会出现“看着对、永远对不上”的怪事。
-- **`trusted_peers` 空 = 不限**：两种模式、人机面与接入面（取脚本 / 登记）用同一个口径；
+- **`trusted_peers` 空 = 不限**：人机面与接入面（取脚本 / 登记）用同一个口径；
   非空时严格匹配（unix 条目对 TCP 对端不生效）。
 - 响应里的 `token`（`wcr_...`）**只此一次**；磁盘只留 `sha256` 摘要 ——
   实测在 `state/credentials.db` 里搜不到 `wcr_`。

@@ -338,6 +338,13 @@ struct RawServer {
     listen_addr: String,
     #[serde(default = "default_mode")]
     mode: String,
+    /// 0.7.0 删除了 `mode = "ingress"`，这个键也跟着没了。
+    ///
+    /// 留一个“墓碑字段”只为一件事：让带着它的老配置得到一句说得清的报错，
+    /// 而不是 serde 的 `unknown field` —— 现场看到后者只会去翻配置格式，
+    /// 想不到是模式被删了。
+    #[serde(default)]
+    ingress_header: Option<String>,
     /// `mode = token` 时的人人面口令。写 `${SEC_CRED_WEB_PASSWORD}`，真值只在密钥文件里。
     #[serde(default)]
     admin_password: Option<String>,
@@ -353,6 +360,7 @@ impl Default for RawServer {
         Self {
             listen_addr: default_listen(),
             mode: default_mode(),
+            ingress_header: None,
             admin_password: None,
             trusted_peers: Vec::new(),
             public_base_url: None,
@@ -547,6 +555,13 @@ impl RawConfig {
             ),
             other => bail!("server.mode must be token|oidc, got {other:?}"),
         };
+
+        if self.server.ingress_header.is_some() {
+            bail!(
+                "server.ingress_header was removed in 0.7.0 together with mode = \"ingress\"; \
+                 delete the key (identity comes from the page password / OIDC only)"
+            );
+        }
 
         let listen_addr = expand(env, &self.server.listen_addr)?;
         if listen_addr.trim().is_empty() {
@@ -910,6 +925,19 @@ mod tests {
         let err = parse(text).expect_err("ingress must not start");
         assert!(
             err.to_string().contains("was removed in 0.7.0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_leftover_ingress_header_gets_a_real_explanation() {
+        // 只删了 mode、留着 ingress_header 的配置（手写的、或从旧示例拷的）也要说清，
+        // 而不是甩一句 serde 的 unknown field。
+        let text = "[server]\nlisten_addr = \"10.0.20.11:8443\"\nmode = \"token\"\nadmin_password = \"x\"\ningress_header = \"x-wist-operator\"\n";
+        let err = parse(text).expect_err("stale key must be rejected");
+        assert!(
+            err.to_string()
+                .contains("ingress_header was removed in 0.7.0"),
             "unexpected error: {err}"
         );
     }
