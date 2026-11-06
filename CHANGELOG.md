@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0-alpha] - 2026-11-06
+
+### 新增：`DELETE /api/v1/peers/{name}`（删除认证系统）
+
+- 删除只是把它从注册表里去掉：net 不再推送、不再探活；它**已签发的凭据不跟随吊销** ——
+  cred 没有“吊销整套系统”的概念，要停用请逐条撤销。
+- 名字进**墓碑**（`peers.json` 的 `removed`）：部署种子（`identity/cred/onboarding/*/peer.json`）
+  是只读挂载、删不掉文件，没有墓碑的话重启时 `import_dir` 会把它“新导入”回来 ——
+  删除等于没删。同名重新创建会清掉墓碑。
+- 落盘失败把内存退回：页面不会出现“删了、重启又回来”。
+- 与其它管理面路由同一套鉴权（`authorize`），404 用 `unknown_peer`、落盘失败用 `store_unavailable`。
+
 ## [0.7.0-alpha] - 2026-11-06
 
 ### 删除（破坏性）：`mode = "ingress"`（身份由反代注入 `x-wist-operator`）
