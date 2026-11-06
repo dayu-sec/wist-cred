@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.7.0-alpha] - 2026-11-06
+
+### 删除（破坏性）：`mode = "ingress"`（身份由反代注入 `x-wist-operator`）
+
+逻辑上它是一个**认证外包的接口**：入口已经验过人，cred 只消费结论。问题在于结论是
+**一个客户端可伪造的请求头** —— 安全边界从“代码正确”被搬到了“拓扑 + 反代剥头正确”，
+而且失守时是**静默放行**。要按人区分身份，正路是 OIDC（`mode = "oidc"` 已留位），不是信任头。
+
+- `AuthMode::Ingress`、`server.ingress_header`、`authorize_ingress()`、“ingress 必须配
+  `trusted_peers`”那条加载期约束全部删除；`server.mode` 只剩 `token`（默认）与 `oidc`（未实现）。
+- 老配置里写 `mode = "ingress"` 现在会**拒绝启动**，且报错直接说明它被删了、该换成什么 ——
+  而不是一句“取值不对”让人去猜。
+- 错误码 `untrusted_ingress_peer` → **`untrusted_peer`**（它本来两种模式都在用，名字一直是误导）。
+- 不变：“页面口令 + `Authorization: Bearer`”、`trusted_peers` 的第二道锁、两条无鉴权面
+  （`GET /api/v1/version`、`/enroll/{token}/…`）全部保留。
+
+**升级注意**（三条都改完再升）：
+
+1. 现场的 cred 配置若还有 `mode = "ingress"` / `ingress_header`：删掉它们，
+   换成 `mode = "token"` + `admin_password = "${SEC_CRED_WEB_PASSWORD}"`（部署栈一直是 token，
+   栈用户无感）；
+2. 开发态（`dev/svc.sh`）已改成 token + `DEV_PASSWORD`（默认 `dev-only-password`），
+   `wist-cred-web` 的 vite 代理也改成在页面**没带**口令时补 `Authorization: Bearer`；
+3. 解析 `untrusted_ingress_peer` 的脚本/告警规则需要改名为 `untrusted_peer`。
+
 ## [0.6.3-alpha] - 2026-11-06
 
 ### 删除（破坏性）：`POST /api/v1/peers/{name}/setup`
