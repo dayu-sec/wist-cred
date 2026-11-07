@@ -1,6 +1,6 @@
 [package]
 name = "wist-cred"
-version = "0.8.0" #@gxl:set(version)
+version = "0.8.2" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["wist Dev Team"]
@@ -25,6 +25,12 @@ toml = "1.1"
 # 与 center / gwlinkd / ingest-ctrl 同一套 PKI 原语：CA 按 CSR 签、主体由 CA 填、
 # notBefore 回拨 300s、随机序列号。**不自己另写一套。**
 wist-pki = "0.1.2"
+# 对外错误投影的 wire 形状（`code` / `message` / `retryable` / `severity` /
+# `correlation_id` / `fields`）：与 gateway / center 同一份定义，不另起一套。
+wist-shared = "0.2"
+# 结构化错误原因 + 生命周期日志：`DomainReason` / `ErrorIdentityProvider` 给稳定码，
+# `OperationContext` 给“成功 suc / 失败 fail + fields + 单行 cause”（与 gateway 同一 idiom）。
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
 # 配置里的 `${SEC_...}`：与其它服务同口径（env 优先，其次 `.galaxy/sec_value.yml`）。
 orion-sec = "0.7"
 orion-variate = "0.14"

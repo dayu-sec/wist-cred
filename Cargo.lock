@@ -1376,6 +1376,7 @@ dependencies = [
  "log",
  "orion-error-derive",
  "serde",
+ "serde_json",
  "smol_str",
  "thiserror 2.0.21",
 ]
@@ -2738,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "wist-cred"
-version = "0.8.0"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2746,6 +2747,7 @@ dependencies = [
  "getrandom 0.3.4",
  "http-body-util",
  "log",
+ "orion-error",
  "orion-sec",
  "orion-variate",
  "rcgen",
@@ -2760,6 +2762,7 @@ dependencies = [
  "wist-auth 0.3.0",
  "wist-cred-peer",
  "wist-pki",
+ "wist-shared",
 ]
 
 [[package]]
@@ -2797,6 +2800,18 @@ dependencies = [
  "serde",
  "time",
  "x509-parser",
+]
+
+[[package]]
+name = "wist-shared"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c9b16ccb1f4661774c7e452f119bd551b66c1d8860b7a9ded3be0e56e9dce82"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "time",
 ]
 
 [[package]]

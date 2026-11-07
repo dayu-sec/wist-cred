@@ -90,13 +90,47 @@ curl -s -X POST https://cred.internal/api/v1/credentials \
 | 请求里的角色不在该认证系统上报的列表里 | `400 role_not_supported`（错误信息会列出它支持什么） |
 | `endpoint` 不是 `https://` | `400 invalid_peer`（推送走 mTLS，不收明文） |
 | `endpoint` 只给 `https://host:port`（没路径） | 落库时**自动补** `/api/v1/internal/credentials`（已有路径则原样保留，尾斜杠去掉） |
-| 认证系统有 `endpoint` 但推送失败 | `500 credential_delivery_pending`，**不给明文** |
+| 认证系统有 `endpoint` 但**推送失败** | 见下方「推送失败的错误形状」：凭据**已落库**，响应里仍带 `credential` + `token`（否则这条凭据永远用不了），可重推 |
 | 接入券重复兑现 / 过期 | `401 enrollment_rejected`（不区分原因） |
 | 建系统 / 接入时**没有登记收数地址** | `400 endpoint_required`（接入拒，**不消耗券**）：让对端自注册带上地址，或在页面/种子里补 |
 | 接入时上报的 `endpoint` | 接受，但**只在券校验通过后**，且只补空（人工/种子设过的优先） |
 | 上报的地址主机名 ≠ 证书 SAN | `400 invalid_enrollment`（不烧券）：cred 以后要往这个地址推、往这里探 |
 | 建的 `host` 与地址主机名不一致 | `400 invalid_peer`（证书 SAN 必须与推数时连的地址一致） |
 | 坏 CSR | `400 invalid_csr`，**不消耗券** |
+
+### 推送失败的错误形状
+
+错误体与 gateway / center **共用同一份定义**（`wist-shared` 的 `ProtocolError`）：
+`code` / `message` / `retryable` / `severity` / `correlation_id` / `fields`，并且响应头带同一个
+`x-request-id`。**内部原因（source / detail）只进日志，不进响应体**。
+
+推送失败分两类，`retryable` 就是它们的分界 —— 页面据此决定给“重试”还是给“去修配置”：
+
+| 情形 | code | HTTP | retryable | `fields` |
+|---|---|---|---|---|
+| 对端**收到并拒绝**（4xx，如 `audience_mismatch`） | `verifier_rejected` | `409` | `false` | `peer` / `upstream_status` / `upstream_code` |
+| 对端回 5xx | `verifier_rejected` | `502` | `true` | 同上 |
+| 连不上 / TLS / 超时 | `verifier_unreachable` | `502` | `true` | `peer` / `endpoint` |
+| 本地造请求失败（签名、序列化） | `push_internal` | `502` | `false` | — |
+
+`retryable` 的**默认值**与 gateway / center 逐条一致：`429/502/503/504` 判可重试，其余 4xx
+判不可重试，其它 5xx（`500`）**不出这个字段**（“重试性未知”，不臆断）。真正需要覆盖的
+两处是：
+
+- `enrollment_disabled`（`503`，没配 CA / 签发材料）：**`retryable=false`** —— 配置问题，重试不会变好；
+- `push_internal`（`502`，本地签名失败）：**`retryable=false`** —— 确定性故障，重试不会变好。
+
+两条附加口径：
+
+- **未匹配路由 / 方法不对**也回同一个信封（`unknown_route` / `method_not_allowed`），
+  页面不必为它们开分支；
+- 带明文令牌的响应（签发成功的 `201`、推送失败的 `409/502`）都带 `Cache-Control: no-store`。
+
+日志口径：一次失败**只记一行** `api error: … request_id=… category=… cause=…`（推送层不重复记）；
+`502/503/504` 记 `warn`（对端没起来是日常），其它 5xx 才记 `error`。
+
+> 旧版的 `credential_delivery_pending` 已拆成上面两类：它把“改配置才好”和“稍后重试”
+> 压成了一句“retry later”，现场会反复重推一条永远不会成功的凭据。
 
 ## 运行
 

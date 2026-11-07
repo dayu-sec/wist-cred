@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod config;
+pub mod error;
 pub mod onboarding;
 pub mod peers;
 pub mod push;

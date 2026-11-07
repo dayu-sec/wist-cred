@@ -46,6 +46,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::config::{AuthMode, Config};
+use crate::error::ApiError;
 use crate::peers::{Health, NewPeer, Peer, PeerError, PeerRegistry};
 use crate::store::{CredentialRecord, Store};
 
@@ -121,6 +122,9 @@ pub fn router(state: AppState) -> Router {
         // 自注册（`cred-peer` 初始化）所需的公开材料：与 `join.sh` 同权（券授权、不消耗）。
         .route("/enroll/{token}/bundle", get(enroll_bundle))
         .route("/enroll/{token}/certificate", post(enroll_peer))
+        // 未匹配路由 / 方法不对也走同一个信封：页面只认 `error.code`，不该为它们开分支。
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
 }
 
@@ -293,11 +297,7 @@ async fn create_peer(
 
     // 没有签发 CA 就没有接入能力：建一个永远登记不了的系统只会误导人。
     if state.signer.is_none() || state.config.onboarding.client_ca.is_none() {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "enrollment_disabled",
-            "this deployment has no signing CA / client CA configured",
-        );
+        return enrollment_disabled("this deployment has no signing CA / client CA configured");
     }
 
     let input = NewPeer {
@@ -456,11 +456,7 @@ async fn mint_script(
 
     // 未配置签发 CA / 客户端 CA 时直接拒：否则发出去的券在 enroll 那一步必然失败。
     if state.signer.is_none() || state.config.onboarding.client_ca.is_none() {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "enrollment_disabled",
-            "this deployment has no signing CA / client CA configured",
-        );
+        return enrollment_disabled("this deployment has no signing CA / client CA configured");
     }
 
     let (token, expires_in) = state.boarding.mint(&target.name);
@@ -520,11 +516,7 @@ async fn fetch_script(
     };
 
     let Some(client_ca) = client_ca_pem(&state.config) else {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "enrollment_disabled",
-            "this deployment has no client CA configured",
-        );
+        return enrollment_disabled("this deployment has no client CA configured");
     };
 
     let enroll_url = format!(
@@ -560,17 +552,17 @@ async fn fetch_script(
             )
                 .into_response()
         }
-        Err(error) => {
-            log::error!(
-                "onboarding script for {:?} is unusable: {error:#}",
-                target.name
-            );
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "onboarding_material_unreadable",
-                error.to_string(),
-            )
-        }
+        Err(error) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "onboarding_material_unreadable",
+            "the onboarding material for this peer could not be rendered; \
+             check the deployment's CA and template files",
+        )
+        .with_cause(format!(
+            "onboarding script for {:?} is unusable: {error:#}",
+            target.name
+        ))
+        .into_response(),
     }
 }
 
@@ -714,11 +706,7 @@ async fn enroll_peer(
     }
 
     let Some(signer) = state.signer.as_ref() else {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "enrollment_disabled",
-            "this deployment has no signing CA configured",
-        );
+        return enrollment_disabled("this deployment has no signing CA configured");
     };
 
     // ③ peek（不消费）：先算清“要签给谁”，有问题就当场拒，别烧券。
@@ -1165,21 +1153,24 @@ async fn create_credential(
     if let (Some((name, endpoint)), Some(push)) = (delivery, &state.push)
         && let Err(error) = push.register(&name, &endpoint, &record).await
     {
-        log::error!(
-            "credential {} stored but not delivered: {error:#}",
-            record.credential_id
-        );
-        return err(
-            StatusCode::BAD_GATEWAY,
-            "credential_delivery_pending",
-            "credential was created but the verifier did not accept it; it was not delivered \
-             (POST /api/v1/credentials/{id}/redeliver to retry)",
-        );
+        // 凭据已经落库，**明文只在这一刻存在**：推送失败时若照旧"不给明文"，
+        // 这条凭据就永远没法用了（重推能补送达，但没有令牌的人拿着也没用）。
+        // 所以仍然把 `credential` + `token` 放在错误响应里，让页面能显示出来，
+        // 并提示"已签发、未送达，可在列表里重推"。
+        let mut body = summary(&record);
+        body["token"] = json!(token);
+        body["delivery"] = json!("pending");
+        return verifier_failure(&error)
+            .with_extra("credential", body)
+            .into_response();
     }
 
     let mut body = summary(&record);
     body["token"] = json!(token);
-    (StatusCode::CREATED, Json(body)).into_response()
+    // 明文令牌只出现这一次：任何缓存都会多留一份副本。
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (StatusCode::CREATED, headers, Json(body)).into_response()
 }
 
 /// 签发策略：页面拿它渲染有效期选项（超出上限的要标出来，而不是静默被压）。
@@ -1397,18 +1388,10 @@ async fn redeliver_credential(
             }))
             .into_response()
         }
-        Err(error) => {
-            log::error!(
-                "redeliver {} to {} failed: {error:#}",
-                record.credential_id,
-                record.audience
-            );
-            err(
-                StatusCode::BAD_GATEWAY,
-                "credential_delivery_pending",
-                "the verifier did not accept the credential; nothing changed, retry later",
-            )
-        }
+        Err(error) => verifier_failure(&error)
+            .with_field("credential_id", record.credential_id.clone())
+            .with_field("audience", record.audience.clone())
+            .into_response(),
     }
 }
 
@@ -1612,11 +1595,119 @@ fn summary(record: &CredentialRecord) -> Value {
 }
 
 fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({ "error": { "code": code, "message": message.into() } })),
+    ApiError::new(status, code, message).into_response()
+}
+
+/// 本部署没配必需的 CA / 签发材料：**配置问题**，重试不会变好。
+///
+/// 503 的默认 `retryable` 是 `true`（瞬时上游故障语义），这里必须显式改口，
+/// 否则页面会一直给一个永远不会成功的「重试」按钮。
+fn enrollment_disabled(message: impl Into<String>) -> Response {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "enrollment_disabled",
+        message,
     )
-        .into_response()
+    .with_retryable(false)
+    .into_response()
+}
+
+/// 没匹配到路由：与业务错误同一个信封（页面不用为它开一个分支）。
+async fn unknown_route(uri: axum::http::Uri) -> Response {
+    err(
+        StatusCode::NOT_FOUND,
+        "unknown_route",
+        format!("no route matches {uri}"),
+    )
+}
+
+/// 路由存在但方法不对：同样走信封，并把 `Allow` 说清楚。
+async fn method_not_allowed(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    err(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        format!("{method} is not allowed on {uri}"),
+    )
+}
+
+/// 把一次推送失败投影成对外错误。
+///
+/// 两类原因**处置完全不同**，所以状态码与 `retryable` 分开；`code` 与生态分类直接取自
+/// `PushError` 的 `ErrorIdentityProvider` 实现 —— 叫法只有一处。
+///
+/// - 上游 **4xx 拒绝**（如 `audience_mismatch`）：`409 verifier_rejected`、**不可重试** ——
+///   它是配置/契约问题，重试一辈子也不会成功。上游业务码进 `fields.upstream_code`，
+///   页面可据此直接说“两边受众名不一致”。
+/// - **连不上 / TLS / 超时**：`502 verifier_unreachable`、**可重试**。
+/// - 本地造请求就失败（签名、序列化）：`502 push_internal`、**不可重试** —— 签名失败是
+///   确定性的，重试不会自己变好。
+///
+/// 三个分支都带 `no-store`：签发路径上的错误体会携带明文 `credential.token`。
+fn verifier_failure(error: &crate::push::PushError) -> ApiError {
+    use crate::push::PushError;
+    use orion_error::reason::ErrorIdentityProvider;
+
+    let code = error.stable_code();
+    let category = error.error_category().as_str();
+    match error {
+        PushError::Rejected {
+            peer,
+            status,
+            code: upstream_code,
+            message,
+            ..
+        } => {
+            let client_side = (400..500).contains(status);
+            let summary = match upstream_code {
+                Some(upstream_code) => {
+                    format!("the verifier rejected this credential ({upstream_code}): {message}")
+                }
+                None => format!("the verifier rejected this credential: {message}"),
+            };
+            ApiError::new(
+                if client_side {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                code,
+                summary,
+            )
+            .with_retryable(!client_side)
+            .with_field("peer", peer.clone())
+            .with_field("upstream_status", status.to_string())
+            .with_optional_field("upstream_code", error.code().map(str::to_string))
+            .with_no_store()
+            .with_cause(error)
+            .with_cause_category(category)
+        }
+        PushError::Unreachable {
+            peer,
+            endpoint,
+            detail,
+            ..
+        } => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            code,
+            format!("could not reach the verifier {peer:?}; nothing was delivered"),
+        )
+        .with_retryable(true)
+        .with_field("peer", peer.clone())
+        .with_field("endpoint", endpoint.clone())
+        .with_no_store()
+        .with_cause(detail)
+        .with_cause_category(category),
+        PushError::Internal { detail, .. } => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            code,
+            "the credential was stored but could not be pushed (internal error); \
+             this is a local fault, retrying will not help",
+        )
+        .with_retryable(false)
+        .with_no_store()
+        .with_cause(detail)
+        .with_cause_category(category),
+    }
 }
 
 fn mode_name(mode: AuthMode) -> &'static str {
@@ -1834,6 +1925,20 @@ mod tests {
             peer: &str,
             body: Option<Value>,
         ) -> (StatusCode, Value) {
+            let (status, _, value) = self
+                .call_with_headers(method, uri, credential, peer, body)
+                .await;
+            (status, value)
+        }
+
+        async fn call_with_headers(
+            &self,
+            method: &str,
+            uri: &str,
+            credential: Option<&str>,
+            peer: &str,
+            body: Option<Value>,
+        ) -> (StatusCode, HeaderMap, Value) {
             let mut builder = Request::builder().method(method).uri(uri);
             // 第 3 个参数是“页面口令” —— 全仓只有 `Authorization: Bearer` 一条路，
             // 不再有“反代注入的操作者头”那种可以被请求方伪造的身份来源。
@@ -1853,13 +1958,14 @@ mod tests {
 
             let response = router(self.state.clone()).oneshot(request).await.unwrap();
             let status = response.status();
+            let headers = response.headers().clone();
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
             let value = if bytes.is_empty() {
                 Value::Null
             } else {
                 serde_json::from_slice(&bytes).unwrap()
             };
-            (status, value)
+            (status, headers, value)
         }
 
         fn store_text(&self) -> String {
@@ -1959,11 +2065,130 @@ mod tests {
         }
     }
 
+    // ── 推送失败的投影：上游拒绝 vs 连不上 ────────────────────────────────
+
+    #[test]
+    fn an_upstream_4xx_rejection_is_a_conflict_and_not_retryable() {
+        let error = crate::push::PushError::Rejected {
+            action: "register",
+            peer: "wist-field".to_string(),
+            endpoint: "https://field/api/v1/internal/credentials".to_string(),
+            status: 400,
+            code: Some("audience_mismatch".to_string()),
+            message: "this service is wist-field-api".to_string(),
+        };
+        let api = super::verifier_failure(&error);
+        assert_eq!(api.status(), StatusCode::CONFLICT);
+        assert_eq!(api.code(), "verifier_rejected");
+        assert_eq!(api.retryable(), Some(false), "改配置才好，重试无用");
+        assert_eq!(api.field("peer"), Some("wist-field"));
+        assert_eq!(api.field("upstream_status"), Some("400"));
+        assert_eq!(api.field("upstream_code"), Some("audience_mismatch"));
+    }
+
+    #[test]
+    fn an_unreachable_verifier_is_a_retryable_gateway_error() {
+        let error = crate::push::PushError::Unreachable {
+            action: "register",
+            peer: "wist-center".to_string(),
+            endpoint: "https://center/api/v1/internal/credentials".to_string(),
+            detail: "tcp connect error".to_string(),
+        };
+        let api = super::verifier_failure(&error);
+        assert_eq!(api.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(api.code(), "verifier_unreachable");
+        assert_eq!(
+            api.retryable(),
+            Some(true),
+            "连不上是瞬时故障，稍后重试才有意义"
+        );
+        assert_eq!(api.field("peer"), Some("wist-center"));
+        assert_eq!(api.field("upstream_status"), None);
+    }
+
+    #[test]
+    fn an_upstream_5xx_rejection_is_retryable() {
+        let error = crate::push::PushError::Rejected {
+            action: "register",
+            peer: "wist-field".to_string(),
+            endpoint: "https://field/api".to_string(),
+            status: 503,
+            code: None,
+            message: String::new(),
+        };
+        let api = super::verifier_failure(&error);
+        assert_eq!(api.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(api.retryable(), Some(true));
+    }
+
+    /// 签名 / 序列化失败是确定性的：重试不会自己变好，页面不许给“重试”按钮。
+    #[test]
+    fn a_local_push_failure_is_not_retryable() {
+        let error = crate::push::PushError::Internal {
+            action: "sign",
+            detail: "signing key is unusable".to_string(),
+        };
+        let api = super::verifier_failure(&error);
+        assert_eq!(api.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(api.code(), "push_internal");
+        assert_eq!(api.retryable(), Some(false));
+    }
+
+    /// 没配 CA / 签发材料是配置问题：503 的默认 `retryable` 是 true，必须显式改口。
+    #[tokio::test]
+    async fn a_disabled_enrollment_is_not_retryable() {
+        let harness = Harness::new().with_peer("wist-center", "center.internal");
+        let (status, body) = harness
+            .call(
+                "POST",
+                "/api/v1/peers/wist-center/enrollment-tickets",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "enrollment_disabled");
+        assert_eq!(body["error"]["retryable"], false, "重试不会把 CA 变出来");
+    }
+
+    /// 未匹配路由 / 方法不对也要是信封，否则页面只能报 `unknown_error`。
+    #[tokio::test]
+    async fn unknown_routes_and_methods_use_the_error_envelope() {
+        let harness = Harness::new();
+
+        let (status, body) = harness
+            .call(
+                "GET",
+                "/api/v1/nope",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "unknown_route");
+        assert_eq!(body["error"]["retryable"], false);
+        assert!(body["error"]["correlation_id"].is_string(), "got {body}");
+
+        let (status, body) = harness
+            .call(
+                "PUT",
+                "/api/v1/credentials",
+                Some(PAGE_PASSWORD),
+                "127.0.0.1",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(body["error"]["code"], "method_not_allowed");
+    }
+
     #[tokio::test]
     async fn create_returns_token_once_and_stores_only_the_digest() {
         let harness = Harness::new();
-        let (status, body) = harness
-            .call(
+        let (status, headers, body) = harness
+            .call_with_headers(
                 "POST",
                 "/api/v1/credentials",
                 Some(PAGE_PASSWORD),
@@ -1972,6 +2197,13 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+        // 明文令牌只出现这一次：响应不能被任何一层缓存住。
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
 
         let token = body["token"].as_str().expect("token").to_string();
         assert!(token.starts_with(TOKEN_PREFIX));
