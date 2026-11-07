@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.8.2-alpha] - 2026-11-07
+
+### 变更（破坏性）：推送失败分成三类，错误体改用生态统一形状
+
+以前推送失败一律 `502 credential_delivery_pending` + “nothing changed, retry later”：
+把「对方说不认识这个受众（改配置才好）」和「连不上（稍后重试才有意义）」压成同一句，
+现场会反复重推一条永远不会成功的凭据，而真正原因只躺在容器日志里。
+
+- 错误体升级成 `wist-shared` 的 `ProtocolError`（与 gateway / center 同一份定义）：
+  `code` / `message` / `retryable` / `severity` / `correlation_id` / `fields`；
+  响应头带同一个 `x-request-id`，页面报错可以直接对上容器日志。
+- **`credential_delivery_pending` 拆成三个码**：
+  - `verifier_rejected`（`409`，`retryable=false`）：对方收到并拒绝（4xx）；
+    `fields.upstream_status` / `fields.upstream_code` 带对方的原话，例如 `audience_mismatch`；
+  - `verifier_unreachable`（`502`，`retryable=true`）：DNS / TCP / TLS / 超时；
+  - `push_internal`（`502`，`retryable=false`）：本地签名 / 序列化失败 —— 确定性故障。
+- 上游 5xx 仍归 `verifier_rejected`，但 `retryable=true`（它确实可能自己恢复）。
+- **`retryable` 的默认值与 gateway / center 对齐**：`429/502/503/504` 可重试，其余 4xx 不可，
+  其它 5xx（`500`）**不出这个字段**。`enrollment_disabled`（503，本部署没配 CA）显式
+  `retryable=false` —— 本次之前它是 `true`，页面会给一个永远不会成功的重试按钮。
+- **内部原因不进响应体**（设计文档 §6）：source / detail 只写单行日志，带同一个 correlation id。
+- 一次失败**只记一行**日志（`api error: … request_id=… category=… cause=…`）；推送层只记成功，
+  不再重复记。`502/503/504` 记 `warn`，其余 5xx 记 `error`。
+- 稳定码与分类只有一处来源：`PushError` 的 `ErrorIdentityProvider` 实现；API 层不再手写码。
+
+### 其他修正（同一版）
+
+- `POST /api/v1/credentials` 成功（`201`）与推送失败（`409/502`）的响应都带
+  `Cache-Control: no-store` —— 它们带着只出现一次的明文令牌。
+- 未匹配路由（`404 unknown_route`）与错误方法（`405 method_not_allowed`）也回统一错误信封
+  （之前是空 body，页面只能报 `unknown_error`）。
+- `onboarding_material_unreadable` 不再把内部错误原文当 `message` 返回，改为固定文案 + 日志 cause。
+
+### 修复：推送失败时凭据的明文被永久丢弃
+
+- `POST /api/v1/credentials` 在推送失败时，旧口径**不给明文**、也没有凭据内容。
+  而明文只在这一刻存在 —— 这条凭据随后既没法用、也没法“重推后就能用”（重推只补送达）。
+- 现在错误响应里仍带 `credential`（摘要 + `token` + `delivery: "pending"`）：页面照常显示令牌，
+  并提示“已签发但没送达”。状态码与错误码按上面的分类走。
+
+**升级注意**：解析 `credential_delivery_pending` 的脚本 / 告警要同时接受新码；
+页面请跟版 `wist-cred-web >= 0.6.2`（它按 `retryable` 决定给“重试”还是“去修配置”）。
+
 ## [0.8.0-alpha] - 2026-11-06
 
 ### 新增：`DELETE /api/v1/peers/{name}`（删除认证系统）
